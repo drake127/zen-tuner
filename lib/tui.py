@@ -241,6 +241,12 @@ class CursesPresenter(TestEventListener):
         hdr = f"[{ts}] [Cycle {cycle_num}] Testing Core {core.core_idx} ({ccd_desc}) - {ht_label}"
         self._add_log(f"┌── {hdr}", self.COLOR_ACTIVE)
 
+    def print_core_skip(self, cycle_num: int, core: PhysicalCore, reason: str = "already failed") -> None:
+        ts = get_iso_timestamp()
+        ccd_desc = f"CCD {core.ccd_id}" if core.ccd_id is not None else "CCD 0"
+        msg = f"├── [{ts}] [Cycle {cycle_num}] Skipping Core {core.core_idx} ({ccd_desc}) - {reason}"
+        self._add_log(msg, self.COLOR_WARN)
+
     def print_core_result(self, core: PhysicalCore, result: RunResult, idle_core_name: str | None = None) -> None:
         ts = get_iso_timestamp()
         if result.status == "INTERRUPTED":

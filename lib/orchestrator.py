@@ -79,12 +79,25 @@ class ZenTunerOrchestrator:
 
         try:
             while not self.interrupted:
+                # Stop if all selected cores have already failed
+                active_candidates = [c for c in selected_cores if self.stats[c.core_idx].failures == 0]
+                if not active_candidates:
+                    if self.presenter and hasattr(self.presenter, "_write"):
+                        self.presenter._write("\n[!] All selected cores have failed. Stopping cycle runs.")
+                    break
+
                 if self.presenter and hasattr(self.presenter, "print_cycle_start"):
                     self.presenter.print_cycle_start(cycle_num, cycles)
 
                 for core in selected_cores:
                     if self.interrupted:
                         break
+
+                    # Skip cores that have already failed in a previous cycle
+                    if self.stats[core.core_idx].failures > 0:
+                        if self.presenter and hasattr(self.presenter, "print_core_skip"):
+                            self.presenter.print_core_skip(cycle_num, core, reason="already failed")
+                        continue
 
                     test_cpus, ht_label = self._resolve_test_cpus(core, hyperthreading_mode, cycle_num)
 

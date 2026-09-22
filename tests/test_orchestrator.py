@@ -170,6 +170,95 @@ class TestOrchestrator(unittest.TestCase):
         orch = ZenTunerOrchestrator(runner=runner, all_cores=self.cores, presenter=presenter)
         self.assertIs(presenter.stats, orch.stats)
 
+    def test_orchestrator_skips_failed_core_in_subsequent_cycles(self):
+        from unittest.mock import MagicMock
+
+        fail_res = RunResult(
+            passed=False,
+            status="ACTIVE_ERROR",
+            tested_cpus=[0, 12],
+            completed_tests=0,
+            elapsed_seconds=2.0,
+            active_errors=["Fatal error"],
+        )
+        pass_res = RunResult(
+            passed=True,
+            status="PASS",
+            tested_cpus=[1, 13],
+            completed_tests=2,
+            elapsed_seconds=5.0,
+        )
+
+        class SequenceRunner(StressRunner):
+            def __init__(self):
+                self.calls = []
+
+            @property
+            def name(self):
+                return "seq"
+
+            def is_available(self):
+                return True
+
+            @classmethod
+            def add_cli_arguments(cls, parser):
+                pass
+
+            def run_test(self, req, listener=None):
+                self.calls.append(req.cpus)
+                if req.cpus == [0, 12]:
+                    return fail_res
+                return pass_res
+
+        runner = SequenceRunner()
+        presenter = MagicMock()
+        orch = ZenTunerOrchestrator(runner=runner, all_cores=self.cores, presenter=presenter)
+        stats = orch.run(
+            selected_cores=self.cores,
+            duration_per_core=5.0,
+            continue_on_error=True,
+            cycles=2,
+        )
+
+        # Cycle 1 ran core 0 (fail) and core 1 (pass). Cycle 2 ran only core 1 (pass).
+        self.assertEqual(len(runner.calls), 3)
+        self.assertEqual(runner.calls[0], [0, 12])
+        self.assertEqual(runner.calls[1], [1, 13])
+        self.assertEqual(runner.calls[2], [1, 13])
+
+        self.assertEqual(stats[0].failures, 1)
+        self.assertEqual(stats[0].passes, 0)
+        self.assertEqual(stats[1].failures, 0)
+        self.assertEqual(stats[1].passes, 2)
+
+        presenter.print_core_skip.assert_called_once()
+        skip_call = presenter.print_core_skip.call_args
+        self.assertEqual(skip_call[0][0], 2)  # cycle_num = 2
+        self.assertEqual(skip_call[0][1], self.cores[0])  # core 0
+
+    def test_orchestrator_stops_when_all_cores_failed(self):
+        fail_res = RunResult(
+            passed=False,
+            status="ACTIVE_ERROR",
+            tested_cpus=[0, 12],
+            completed_tests=0,
+            elapsed_seconds=2.0,
+            active_errors=["Fatal error"],
+        )
+        runner = MockRunner(result_to_return=fail_res)
+        orch = ZenTunerOrchestrator(runner=runner, all_cores=self.cores)
+        stats = orch.run(
+            selected_cores=self.cores,
+            duration_per_core=5.0,
+            continue_on_error=True,
+            cycles=3,
+        )
+
+        # Both cores failed in Cycle 1. Cycles 2 and 3 should not run.
+        self.assertEqual(len(runner.recorded_requests), 2)
+        self.assertEqual(stats[0].failures, 1)
+        self.assertEqual(stats[1].failures, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
