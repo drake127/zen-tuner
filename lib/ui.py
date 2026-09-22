@@ -1,0 +1,57 @@
+"""
+Terminal utilities for Zen Tuner: Logger, ANSI colour constants, and helper functions.
+"""
+
+import datetime
+import os
+import re
+
+# ANSI Color codes
+BOLD = "\033[1m"
+DIM = "\033[2m"
+RED = "\033[31m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+BLUE = "\033[34m"
+MAGENTA = "\033[35m"
+CYAN = "\033[36m"
+WHITE = "\033[37m"
+RESET = "\033[0m"
+
+ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
+
+
+def strip_ansi(text: str) -> str:
+    """Removes all ANSI terminal control escape sequences from text."""
+    return ANSI_ESCAPE_RE.sub("", text)
+
+
+def get_iso_timestamp() -> str:
+    """Returns the current local date and time formatted in ISO 8601 (%Y-%m-%dT%H:%M:%S)."""
+    return datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+
+class Logger:
+    """Writes log messages to console and persists an uncolored plain-text copy to a log file."""
+
+    def __init__(self, log_path: str):
+        self.log_path = log_path
+        os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
+        self.file = open(log_path, "a", encoding="utf-8")
+
+    def __enter__(self) -> "Logger":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
+    def log(self, text: str, to_console: bool = True) -> None:
+        if to_console:
+            print(text)
+        clean_text = strip_ansi(text)
+        self.file.write(clean_text + "\n")
+        self.file.flush()
+
+    def close(self) -> None:
+        if not self.file.closed:
+            self.file.close()

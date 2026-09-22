@@ -1,0 +1,6 @@
+# Python temporary files
+__pycache__/
+.pytest_cache/
+
+# Zen Tuner logs & temporary runs
+logs/
