@@ -52,33 +52,21 @@ class SmuTableOffsets:
         core_cc6: int,
         core_fit: Optional[int] = None,
         core_iddmax: Optional[int] = None,
-        soc_voltage: Optional[int] = 45,
-        vddp_voltage: Optional[int] = 137,
-        vddg_ccd_voltage: Optional[int] = 139,
-        vddg_iod_voltage: Optional[int] = 138,
-        socket_power: int = 29,
-        ppt_limit: int = 0,
-        ppt_value: int = 1,
-        tdc_limit: int = 2,
-        tdc_value: int = 3,
-        thm_limit: int = 4,
-        thm_value: int = 5,
-        edc_limit: int = 8,
-        edc_value: int = 9,
+        soc_voltage: Optional[int] = None,
+        vddp_voltage: Optional[int] = None,
+        vddg_ccd_voltage: Optional[int] = None,
+        vddg_iod_voltage: Optional[int] = None,
+        socket_power: Optional[int] = None,
+        ppt_limit: Optional[int] = None,
+        ppt_value: Optional[int] = None,
+        tdc_limit: Optional[int] = None,
+        tdc_value: Optional[int] = None,
+        thm_limit: Optional[int] = None,
+        thm_value: Optional[int] = None,
+        edc_limit: Optional[int] = None,
+        edc_value: Optional[int] = None,
     ):
-        self.ppt_limit = ppt_limit
-        self.ppt_value = ppt_value
-        self.tdc_limit = tdc_limit
-        self.tdc_value = tdc_value
-        self.thm_limit = thm_limit
-        self.thm_value = thm_value
-        self.edc_limit = edc_limit
-        self.edc_value = edc_value
-        self.socket_power = socket_power
-        self.soc_voltage = soc_voltage
-        self.vddp_voltage = vddp_voltage
-        self.vddg_ccd_voltage = vddg_ccd_voltage
-        self.vddg_iod_voltage = vddg_iod_voltage
+        # Per-core offsets
         self.core_power = core_power
         self.core_voltage = core_voltage
         self.core_temp = core_temp
@@ -90,10 +78,28 @@ class SmuTableOffsets:
         self.core_cc1 = core_cc1
         self.core_cc6 = core_cc6
 
+        # Package / PBO limits and global telemetry offsets
+        self.socket_power = socket_power
+        self.ppt_limit = ppt_limit
+        self.ppt_value = ppt_value
+        self.tdc_limit = tdc_limit
+        self.tdc_value = tdc_value
+        self.thm_limit = thm_limit
+        self.thm_value = thm_value
+        self.edc_limit = edc_limit
+        self.edc_value = edc_value
+
+        # Fabric & Uncore voltages
+        self.soc_voltage = soc_voltage
+        self.vddp_voltage = vddp_voltage
+        self.vddg_ccd_voltage = vddg_ccd_voltage
+        self.vddg_iod_voltage = vddg_iod_voltage
+
 
 # Mappings derived from community hardware research (ZenStates-Core by irusanov, ryzen_smu by leogx9r)
+# Each architecture/version explicitly defines its package limits and core metric indices.
 OFFSETS_MAP: Dict[int, SmuTableOffsets] = {
-    # Zen 3 (Vermeer AGESA v1)
+    # Zen 3 (Vermeer AGESA v1 - 0x380804)
     PM_VER_ZEN3_VERMEER_1: SmuTableOffsets(
         core_power=169,
         core_voltage=185,
@@ -105,12 +111,21 @@ OFFSETS_MAP: Dict[int, SmuTableOffsets] = {
         core_c0=281,
         core_cc1=297,
         core_cc6=313,
+        socket_power=29,
+        ppt_limit=0,
+        ppt_value=1,
+        tdc_limit=2,
+        tdc_value=3,
+        thm_limit=4,
+        thm_value=5,
+        edc_limit=8,
+        edc_value=15,
         soc_voltage=45,
         vddp_voltage=137,
         vddg_ccd_voltage=139,
         vddg_iod_voltage=138,
     ),
-    # Zen 3 (Vermeer AGESA v2 - latest)
+    # Zen 3 (Vermeer AGESA v2 - 0x380805, latest)
     PM_VER_ZEN3_VERMEER_2: SmuTableOffsets(
         core_power=172,
         core_voltage=188,
@@ -122,12 +137,21 @@ OFFSETS_MAP: Dict[int, SmuTableOffsets] = {
         core_c0=284,
         core_cc1=300,
         core_cc6=316,
+        socket_power=29,
+        ppt_limit=0,
+        ppt_value=1,
+        tdc_limit=2,
+        tdc_value=3,
+        thm_limit=4,
+        thm_value=5,
+        edc_limit=8,
+        edc_value=15,
         soc_voltage=45,
         vddp_voltage=137,
         vddg_ccd_voltage=139,
         vddg_iod_voltage=138,
     ),
-    # Zen 3 Generic fallback
+    # Zen 3 Generic fallback (Ryzen 5000 / Milan / Chagall family)
     PM_VER_ZEN3_GENERIC: SmuTableOffsets(
         core_power=172,
         core_voltage=188,
@@ -139,6 +163,15 @@ OFFSETS_MAP: Dict[int, SmuTableOffsets] = {
         core_c0=284,
         core_cc1=300,
         core_cc6=316,
+        socket_power=29,
+        ppt_limit=0,
+        ppt_value=1,
+        tdc_limit=2,
+        tdc_value=3,
+        thm_limit=4,
+        thm_value=5,
+        edc_limit=8,
+        edc_value=15,
         soc_voltage=45,
         vddp_voltage=137,
         vddg_ccd_voltage=139,
@@ -156,12 +189,21 @@ OFFSETS_MAP: Dict[int, SmuTableOffsets] = {
         core_c0=259,
         core_cc1=275,
         core_cc6=291,
+        socket_power=29,
+        ppt_limit=0,
+        ppt_value=1,
+        tdc_limit=2,
+        tdc_value=3,
+        thm_limit=4,
+        thm_value=5,
+        edc_limit=8,
+        edc_value=15,
         soc_voltage=45,
         vddp_voltage=125,
         vddg_ccd_voltage=None,
         vddg_iod_voltage=126,
     ),
-    # Zen 2 Generic fallback
+    # Zen 2 Generic fallback (Ryzen 3000 / Rome family)
     PM_VER_ZEN2_GENERIC: SmuTableOffsets(
         core_power=147,
         core_voltage=163,
@@ -173,12 +215,21 @@ OFFSETS_MAP: Dict[int, SmuTableOffsets] = {
         core_c0=259,
         core_cc1=275,
         core_cc6=291,
+        socket_power=29,
+        ppt_limit=0,
+        ppt_value=1,
+        tdc_limit=2,
+        tdc_value=3,
+        thm_limit=4,
+        thm_value=5,
+        edc_limit=8,
+        edc_value=15,
         soc_voltage=45,
         vddp_voltage=125,
         vddg_ccd_voltage=None,
         vddg_iod_voltage=126,
     ),
-    # Zen 1 / Zen+ Generic fallback
+    # Zen 1 / Zen+ Generic fallback (Summit Ridge / Pinnacle Ridge)
     PM_VER_ZEN1_GENERIC: SmuTableOffsets(
         core_power=115,
         core_voltage=131,
@@ -188,6 +239,15 @@ OFFSETS_MAP: Dict[int, SmuTableOffsets] = {
         core_c0=195,
         core_cc1=211,
         core_cc6=227,
+        socket_power=29,
+        ppt_limit=0,
+        ppt_value=1,
+        tdc_limit=2,
+        tdc_value=3,
+        thm_limit=4,
+        thm_value=5,
+        edc_limit=None,
+        edc_value=None,
         soc_voltage=26,
         vddp_voltage=17,
         vddg_ccd_voltage=None,
@@ -202,6 +262,15 @@ OFFSETS_MAP: Dict[int, SmuTableOffsets] = {
         core_c0=195,
         core_cc1=211,
         core_cc6=227,
+        socket_power=29,
+        ppt_limit=0,
+        ppt_value=1,
+        tdc_limit=2,
+        tdc_value=3,
+        thm_limit=4,
+        thm_value=5,
+        edc_limit=None,
+        edc_value=None,
         soc_voltage=24,
         vddp_voltage=15,
         vddg_ccd_voltage=None,
@@ -230,8 +299,10 @@ def get_smu_table_offsets(version: int) -> Optional[SmuTableOffsets]:
     return None
 
 
-def read_float(buffer: bytes, index: int) -> float:
-    """Unpacks a 32-bit little-endian float from the buffer at the given float index."""
+def read_float(buffer: bytes, index: Optional[int]) -> Optional[float]:
+    """Unpacks a 32-bit little-endian float from the buffer at the given float index, or None if index is None."""
+    if index is None:
+        return None
     offset = index * 4
     if offset + 4 > len(buffer):
         return 0.0
@@ -281,18 +352,18 @@ def parse_pm_table_buffer(
     vddg_iod_v = read_float(raw_bytes, offsets.vddg_iod_voltage) if offsets.vddg_iod_voltage else 0.0
 
     package = PackageSmuMetrics(
-        socket_power_w=read_float(raw_bytes, offsets.socket_power),
-        package_temp_c=read_float(raw_bytes, offsets.thm_value),
-        ppt_w=read_float(raw_bytes, offsets.ppt_value),
-        ppt_limit_w=read_float(raw_bytes, offsets.ppt_limit),
-        tdc_a=read_float(raw_bytes, offsets.tdc_value),
-        tdc_limit_a=read_float(raw_bytes, offsets.tdc_limit),
-        edc_a=read_float(raw_bytes, offsets.edc_value),
-        edc_limit_a=read_float(raw_bytes, offsets.edc_limit),
-        soc_voltage_v=soc_v if 0.1 <= soc_v <= 2.5 else None,
-        vddp_voltage_v=vddp_v if 0.1 <= vddp_v <= 2.5 else None,
-        vddg_ccd_voltage_v=vddg_ccd_v if 0.1 <= vddg_ccd_v <= 2.5 else None,
-        vddg_iod_voltage_v=vddg_iod_v if 0.1 <= vddg_iod_v <= 2.5 else None,
+        socket_power_w=read_float(raw_bytes, offsets.socket_power) or 0.0,
+        package_temp_c=read_float(raw_bytes, offsets.thm_value) or 0.0,
+        ppt_w=read_float(raw_bytes, offsets.ppt_value) or 0.0,
+        ppt_limit_w=read_float(raw_bytes, offsets.ppt_limit) or 0.0,
+        tdc_a=read_float(raw_bytes, offsets.tdc_value) or 0.0,
+        tdc_limit_a=read_float(raw_bytes, offsets.tdc_limit) or 0.0,
+        edc_a=read_float(raw_bytes, offsets.edc_value) or 0.0,
+        edc_limit_a=read_float(raw_bytes, offsets.edc_limit) or 0.0,
+        soc_voltage_v=soc_v if soc_v and 0.1 <= soc_v <= 2.5 else None,
+        vddp_voltage_v=vddp_v if vddp_v and 0.1 <= vddp_v <= 2.5 else None,
+        vddg_ccd_voltage_v=vddg_ccd_v if vddg_ccd_v and 0.1 <= vddg_ccd_v <= 2.5 else None,
+        vddg_iod_voltage_v=vddg_iod_v if vddg_iod_v and 0.1 <= vddg_iod_v <= 2.5 else None,
     )
 
     has_second_ccd = any(s >= 8 for s in enabled_slots) or (

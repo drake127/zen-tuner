@@ -30,7 +30,7 @@ def create_mock_pm_buffer_zen3_v1() -> bytes:
     set_f(4, 90.0)   # TjMax °C
     set_f(5, 65.5)   # Package Temp °C
     set_f(8, 140.0)  # EDC Limit A
-    set_f(9, 90.1)   # EDC Value A
+    set_f(15, 90.1)  # EDC Value A
     set_f(29, 80.0)  # Socket Power W
     set_f(45, 0.957) # SoC V (actual after droop)
     set_f(137, 0.85) # VDDP V
@@ -62,7 +62,7 @@ def create_mock_pm_buffer_zen3_v2() -> bytes:
     set_f(3, 50.0)
     set_f(5, 70.0)
     set_f(8, 140.0)
-    set_f(9, 100.0)
+    set_f(15, 100.0)
     set_f(29, 88.0)
     set_f(45, 0.957) # SoC V (actual after droop)
     set_f(137, 0.85)  # VDDP V
