@@ -57,7 +57,8 @@ class CursesPresenter(TestEventListener):
             except Exception:
                 pass
 
-        self.log_lines: deque[tuple[str, int]] = deque(maxlen=2000)
+        self.log_lines: deque[tuple[str, int]] = deque(maxlen=4096)
+        self.log_scroll_offset = 0
         self.cycle_num = 1
         self.total_cycles = 1
         self.current_core: PhysicalCore | None = None
@@ -72,6 +73,7 @@ class CursesPresenter(TestEventListener):
         self._curses_active = False
         self._stdscr = None
         self._ticker_thread: threading.Thread | None = None
+        self._input_thread: threading.Thread | None = None
         self._refresh_event = threading.Event()
         self._old_sigwinch = None
 
@@ -122,9 +124,15 @@ class CursesPresenter(TestEventListener):
                     pass
 
             self._stdscr.keypad(True)
-            self._stdscr.nodelay(True)
+            self._stdscr.nodelay(False)  # blocking getch lives in _input_loop
             self._curses_active = True
             self._running = True
+
+            try:
+                curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
+                curses.mouseinterval(0)
+            except curses.error:
+                pass
 
             if hasattr(signal, "SIGWINCH"):
                 try:
@@ -134,6 +142,8 @@ class CursesPresenter(TestEventListener):
 
             self._ticker_thread = threading.Thread(target=self._ticker_loop, daemon=True)
             self._ticker_thread.start()
+            self._input_thread = threading.Thread(target=self._input_loop, daemon=True)
+            self._input_thread.start()
         except Exception:
             self.close()
 
@@ -143,6 +153,8 @@ class CursesPresenter(TestEventListener):
         self._refresh_event.set()
         if self._ticker_thread and self._ticker_thread.is_alive():
             self._ticker_thread.join(timeout=0.5)
+        if self._input_thread and self._input_thread.is_alive():
+            self._input_thread.join(timeout=0.5)
 
         if hasattr(signal, "SIGWINCH") and self._old_sigwinch is not None:
             try:
@@ -200,6 +212,64 @@ class CursesPresenter(TestEventListener):
             self._refresh_event.wait(timeout=self.refresh_interval)
             self._refresh_event.clear()
 
+    def _scroll_log(self, delta: int) -> None:
+        """Adjusts log_scroll_offset by delta lines, clamped to valid range.
+
+        Positive delta scrolls UP (toward older entries); negative scrolls DOWN (toward newest).
+        offset=0 means follow-mode (always show tail).
+        """
+        total = len(self.log_lines)
+        # Estimate visible height conservatively; will clamp again in _draw_log_pane
+        max_visible = max(1, (self._stdscr.getmaxyx()[0] if self._stdscr else 24) - 8)
+        max_offset = max(0, total - max_visible)
+        self.log_scroll_offset = max(0, min(self.log_scroll_offset + delta, max_offset))
+        self.render()
+
+    def _input_loop(self) -> None:
+        """Dedicated input thread: handles keyboard and mouse scroll events."""
+        while self._running:
+            if not self._stdscr:
+                time.sleep(0.05)
+                continue
+            try:
+                key = self._stdscr.getch()
+            except curses.error:
+                time.sleep(0.05)
+                continue
+
+            if not self._running:
+                break
+
+            if key == curses.KEY_UP:
+                self._scroll_log(3)
+            elif key == curses.KEY_DOWN:
+                self._scroll_log(-3)
+            elif key == curses.KEY_PPAGE:
+                self._scroll_log(20)
+            elif key == curses.KEY_NPAGE:
+                self._scroll_log(-20)
+            elif key == curses.KEY_HOME:
+                # Jump to oldest visible entry
+                total = len(self.log_lines)
+                max_visible = max(1, (self._stdscr.getmaxyx()[0] if self._stdscr else 24) - 8)
+                with self._lock:
+                    self.log_scroll_offset = max(0, total - max_visible)
+                self.render()
+            elif key == curses.KEY_END:
+                # Return to follow-mode
+                with self._lock:
+                    self.log_scroll_offset = 0
+                self.render()
+            elif key == curses.KEY_MOUSE:
+                try:
+                    _, _mx, _my, _mz, bstate = curses.getmouse()
+                    if bstate & curses.BUTTON4_PRESSED:
+                        self._scroll_log(3)
+                    elif bstate & curses.BUTTON5_PRESSED:
+                        self._scroll_log(-3)
+                except curses.error:
+                    pass
+
     def _write(self, text: str, to_stderr: bool = False) -> None:
         self._add_log(text, self.COLOR_WARN)
 
@@ -209,8 +279,12 @@ class CursesPresenter(TestEventListener):
             self.logger.log(clean, to_console=False)
         with self._lock:
             self.log_lines.append((clean, color_pair))
+            # When user is scrolled up, keep their position as new lines arrive
+            if self.log_scroll_offset > 0:
+                self.log_scroll_offset = min(self.log_scroll_offset + 1, len(self.log_lines) - 1)
         if self._curses_active:
             self.render()
+
 
     def on_output_line(self, line: str) -> None:
         self._add_log(line, self.COLOR_DEFAULT)
@@ -555,15 +629,39 @@ class CursesPresenter(TestEventListener):
             return 4
 
     def _draw_log_pane(self, top: int, left: int, height: int, width: int) -> None:
-        title = "─ Progress & Validation Log "
-        self._safe_addstr(top, left + 1, title + "─" * max(0, width - len(title) - 2), curses.A_DIM)
+        max_visible = max(0, height - 2)
+        all_lines = list(self.log_lines)
+        total = len(all_lines)
 
-        lines_to_show = list(self.log_lines)[-(height - 2) :] if height > 2 else []
+        # Clamp offset so it can never exceed what's actually scrollable
+        max_offset = max(0, total - max_visible)
+        offset = min(self.log_scroll_offset, max_offset)
+        if offset != self.log_scroll_offset:
+            self.log_scroll_offset = offset
+
+        following = (offset == 0)
+        if following:
+            lines_to_show = all_lines[-max_visible:] if max_visible > 0 else []
+        else:
+            end_idx = total - offset
+            start_idx = max(0, end_idx - max_visible)
+            lines_to_show = all_lines[start_idx:end_idx]
+
+        # Title – show scroll position when not following
+        title_base = "─ Progress & Validation Log "
+        if not following and total > 0:
+            scroll_hint = f" ↑ {offset} lines | End=follow ─"
+            filler = max(0, width - len(title_base) - len(scroll_hint) - 2)
+            title_str = title_base + "─" * filler + scroll_hint
+        else:
+            title_str = title_base + "─" * max(0, width - len(title_base) - 2)
+        self._safe_addstr(top, left + 1, title_str[:width - 2], curses.A_DIM if following else curses.A_BOLD)
+
         for row_idx, (line_text, col_code) in enumerate(lines_to_show):
             attr = self._safe_color_pair(col_code)
             if col_code in (self.COLOR_PASS, self.COLOR_FAIL, self.COLOR_WARN, self.COLOR_ACTIVE):
                 attr |= curses.A_BOLD
-            self._safe_addstr(top + 1 + row_idx, left + 1, line_text[: width - 3], attr)
+            self._safe_addstr(top + 1 + row_idx, left + 1, line_text[:width - 3], attr)
 
         # Vertical divider lines: left border and center divider
         for r in range(height):
@@ -797,5 +895,6 @@ class CursesPresenter(TestEventListener):
 
     def _draw_footer(self, max_y: int, max_x: int) -> None:
         self._safe_addstr(max_y - 2, 0, "═" * (max_x - 1), curses.A_DIM)
-        keys_hint = " [Ctrl+C] Stop & Show Summary   Session Log: " + (self.logger.log_path if self.logger else "N/A")
-        self._safe_addstr(max_y - 1, 0, keys_hint[: max_x - 1], curses.A_DIM)
+        log_path = self.logger.log_path if self.logger else "N/A"
+        keys_hint = " [Ctrl+C] Stop & Summary  [↑↓/PgUp/PgDn] Scroll log  [End] Follow   Log: " + log_path
+        self._safe_addstr(max_y - 1, 0, keys_hint[:max_x - 1], curses.A_DIM)
