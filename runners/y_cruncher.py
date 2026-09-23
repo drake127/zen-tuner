@@ -127,7 +127,7 @@ class YCruncherRunner(StressRunner):
     @classmethod
     def parse_parameters(cls, args: argparse.Namespace) -> tuple[dict[str, Any], str]:
         """Parses y-cruncher CLI arguments into runner parameters and profile description."""
-        algo_arg = getattr(args, "yc_algorithms", None) or getattr(args, "algorithms", "breadpit")
+        algo_arg = getattr(args, "yc_algorithms", "breadpit")
         algo_key = algo_arg.strip().lower()
         if algo_key in ALGORITHM_PRESETS:
             algorithms = list(ALGORITHM_PRESETS[algo_key])
@@ -136,11 +136,9 @@ class YCruncherRunner(StressRunner):
             if not algorithms:
                 algorithms = list(ALGORITHM_PRESETS["breadpit"])
 
-        test_time_val = getattr(args, "yc_test_time", None) or getattr(args, "test_time", "60s")
+        test_time_val = getattr(args, "yc_test_time", "60s")
         seconds_per_test = max(1, int(round(parse_step_time(test_time_val, default_seconds=60.0))))
         memory_mb = getattr(args, "yc_memory", None)
-        if memory_mb is None:
-            memory_mb = getattr(args, "memory", None)
         if memory_mb is not None and memory_mb <= 0:
             memory_mb = None
 
@@ -203,14 +201,20 @@ class YCruncherRunner(StressRunner):
         algorithms = request.parameters.get("algorithms") or ALGORITHM_PRESETS["breadpit"]
         seconds_per_test = request.parameters.get("seconds_per_test", 60)
         memory_mb = request.parameters.get("memory_mb")
-        target_tests = request.target_iterations
+        iterations = request.target_iterations
+        target_tests = (iterations * len(algorithms)) if iterations is not None else None
         duration = request.duration_seconds
 
         run_id = f"yc_{int(time.time() * 1000)}_{os.getpid()}"
         work_dir = os.path.join(self.base_work_dir, run_id)
         os.makedirs(work_dir, exist_ok=True)
 
-        seconds_total = int(round(duration)) if duration is not None and duration > 0 else 0
+        if duration is not None and duration > 0:
+            seconds_total = int(round(duration))
+        elif target_tests is not None:
+            seconds_total = target_tests * seconds_per_test
+        else:
+            seconds_total = 0
         cfg_path = self.write_config(
             work_dir=work_dir,
             cpus=request.cpus,

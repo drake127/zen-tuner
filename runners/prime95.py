@@ -206,7 +206,7 @@ class Prime95Runner(StressRunner):
         """Parses Prime95 CLI arguments into runner parameters and profile description."""
         supported_modes = detect_cpu_instruction_sets()
         default_mode = get_default_instruction_set(supported_modes)
-        req_mode = getattr(args, "prime_mode", None) or getattr(args, "mode", None)
+        req_mode = getattr(args, "prime_mode", None)
         if req_mode:
             mode_val = req_mode.lower()
             if mode_val not in supported_modes:
@@ -218,21 +218,15 @@ class Prime95Runner(StressRunner):
         else:
             mode_val = default_mode
 
-        fft_preset = getattr(args, "prime_fft", None) or getattr(args, "fft", "smallest")
+        fft_preset = getattr(args, "prime_fft", "smallest")
         min_fft = getattr(args, "prime_min_fft", None)
-        if min_fft is None:
-            min_fft = getattr(args, "min_fft", None)
         max_fft = getattr(args, "prime_max_fft", None)
-        if max_fft is None:
-            max_fft = getattr(args, "max_fft", None)
-        memory = getattr(args, "prime_memory", None)
-        if memory is None:
-            memory = getattr(args, "memory", 0)
+        memory = getattr(args, "prime_memory", 0)
 
         fft_cfg = build_fft_config(fft_preset, min_fft, max_fft, memory, mode=mode_val)
         profile_desc = f"{fft_cfg.desc} [{mode_val.upper()}]"
 
-        test_time_val = getattr(args, "prime_test_time", None) or getattr(args, "test_time", "1m")
+        test_time_val = getattr(args, "prime_test_time", "1m")
         sec = parse_step_time(test_time_val, default_seconds=60.0)
         test_time_min = max(1, int(round(sec / 60.0)))
 

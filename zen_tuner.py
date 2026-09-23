@@ -26,18 +26,17 @@ def main() -> None:
     )
     parser.add_argument("--cores", type=str, default="all", help="Cores to test (e.g. 'all', '0-11', '0,2,4') (default: 'all')")
 
-    timing_group = parser.add_mutually_exclusive_group()
-    timing_group.add_argument(
+    parser.add_argument(
+        "--test-iterations",
+        type=int,
+        default=1,
+        help="Number of complete test iterations per core (default: 1)",
+    )
+    parser.add_argument(
         "--time",
         type=str,
         default=None,
-        help="Duration per core (e.g. '360s', '5m', '10m') (default: '360s')",
-    )
-    timing_group.add_argument(
-        "--tests",
-        type=int,
-        default=None,
-        help="Target completed verified self-tests per core (mutually exclusive with --time) (default: None)",
+        help="Optional maximum duration limit per core (e.g. '360s', '5m', '10m') (default: None / unlimited)",
     )
 
     parser.add_argument("--cycles", type=int, default=0, help="Number of cycles (0 for infinite) (default: 0)")
@@ -85,15 +84,8 @@ def main() -> None:
         print(f"[ERROR] {e}", file=sys.stderr)
         sys.exit(1)
 
-    if args.tests is None and args.time is None:
-        duration: float | None = parse_time("360s")
-        target_tests: int | None = None
-    elif args.tests is not None:
-        duration = None
-        target_tests = args.tests
-    else:
-        duration = parse_time(args.time)
-        target_tests = None
+    target_tests: int | None = args.test_iterations
+    duration: float | None = parse_time(args.time) if args.time is not None else None
 
     # Logging setup
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")

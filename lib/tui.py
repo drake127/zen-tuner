@@ -63,6 +63,7 @@ class CursesPresenter(TestEventListener):
         self.current_core: PhysicalCore | None = None
         self.ht_label = ""
         self.ht_mode = "on"
+        self.tests_target: int | None = None
         self.core_start_time = 0.0
         self.last_smu_snapshot: SmuSnapshot | None = None
 
@@ -241,6 +242,7 @@ class CursesPresenter(TestEventListener):
     def print_banner(self, **kwargs) -> None:
         self.ht_mode = kwargs.get("hyperthreading_mode", "on")
         self.profile_info = kwargs.get("profile_info")
+        self.tests_target = kwargs.get("tests_target")
         self.start()
 
     def print_cycle_start(self, cycle_num: int, total_cycles: int, runner_name: str | None = None) -> None:
@@ -514,6 +516,8 @@ class CursesPresenter(TestEventListener):
         test_info = f"Core {curr_idx} ({self.ht_label or 'Idle'})"
         if self.duration_per_core is not None:
             time_info = f"Time: {elapsed:.0f}s / {self.duration_per_core:.0f}s"
+        elif self.tests_target is not None:
+            time_info = f"Time: {elapsed:.0f}s (Iter target: {self.tests_target})"
         else:
             time_info = f"Time: {elapsed:.0f}s"
         pass_info = f"Passes: {tot_passes} | Fails: {tot_fails}"

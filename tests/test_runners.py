@@ -85,17 +85,18 @@ class TestRunners(unittest.TestCase):
         self.assertEqual(listener.lines, ["Test line 1"])
         self.assertEqual(listener.verified, [("4K", 1)])
 
-    def test_cli_mutually_exclusive_time_and_tests(self):
+    def test_cli_test_iterations_and_time(self):
         import subprocess
         import sys
 
         res = subprocess.run(
-            [sys.executable, "zen_tuner.py", "--time", "60s", "--tests", "2"],
+            [sys.executable, "zen_tuner.py", "--help"],
             capture_output=True,
             text=True,
         )
-        self.assertNotEqual(res.returncode, 0)
-        self.assertIn("not allowed with argument", res.stderr)
+        self.assertEqual(res.returncode, 0)
+        self.assertIn("--test-iterations", res.stdout)
+        self.assertIn("--time", res.stdout)
 
     def test_cli_stop_on_error_flag(self):
         import subprocess
@@ -435,7 +436,12 @@ class TestRunners(unittest.TestCase):
              unittest.mock.patch("subprocess.Popen", return_value=fake_proc), \
              unittest.mock.patch("os.sched_setaffinity"):
             runner = YCruncherRunner(base_work_dir=tmpdir)
-            req = TestRequest(cpus=[0], target_iterations=2, graceful=True)
+            req = TestRequest(
+                cpus=[0],
+                target_iterations=1,
+                parameters={"algorithms": ["BBP", "SFTv4"]},
+                graceful=True,
+            )
             listener = DummyListener()
             res = runner.run_test(req, listener=listener)
 
