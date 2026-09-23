@@ -32,12 +32,79 @@ class FFTConfig:
     desc: str
 
 
-FFT_PRESETS: dict[str, FFTConfig] = {
-    "smallest": FFTConfig(4, 4, 0, "Smallest FFTs (4K in-place, L1/L2, max boost)"),
-    "small": FFTConfig(36, 36, 0, "Small FFTs (36K in-place, L1/L2/L3, thermal stress)"),
-    "large": FFTConfig(1344, 1344, 2048, "Large FFTs (1344K, Memory Controller & RAM)"),
-    "blend": FFTConfig(4, 4096, 4096, "Blend (4K-4096K, CPU + RAM cycling)"),
+FFT_PRESET_MATRIX: dict[str, dict[str, FFTConfig]] = {
+    "smallest": {
+        "sse": FFTConfig(4, 21, 0, "Smallest FFTs (4K-21K in-place, L1/L2, max boost)"),
+        "avx": FFTConfig(4, 21, 0, "Smallest FFTs (4K-21K in-place, L1/L2, max boost)"),
+        "avx2": FFTConfig(4, 21, 0, "Smallest FFTs (4K-21K in-place, L1/L2, max boost)"),
+        "avx512": FFTConfig(4, 21, 0, "Smallest FFTs (4K-21K in-place, L1/L2, max boost)"),
+    },
+    "small": {
+        "sse": FFTConfig(40, 248, 0, "Small FFTs (40K-248K in-place, L1/L2/L3, thermal stress)"),
+        "avx": FFTConfig(36, 248, 0, "Small FFTs (36K-248K in-place, L1/L2/L3, thermal stress)"),
+        "avx2": FFTConfig(36, 248, 0, "Small FFTs (36K-248K in-place, L1/L2/L3, thermal stress)"),
+        "avx512": FFTConfig(36, 248, 0, "Small FFTs (36K-248K in-place, L1/L2/L3, thermal stress)"),
+    },
+    "large": {
+        "sse": FFTConfig(426, 8192, 2048, "Large FFTs (426K-8192K, Memory Controller & RAM)"),
+        "avx": FFTConfig(426, 8192, 2048, "Large FFTs (426K-8192K, Memory Controller & RAM)"),
+        "avx2": FFTConfig(426, 8192, 2048, "Large FFTs (426K-8192K, Memory Controller & RAM)"),
+        "avx512": FFTConfig(426, 8192, 2048, "Large FFTs (426K-8192K, Memory Controller & RAM)"),
+    },
+    "blend": {
+        "sse": FFTConfig(4, 8192, 4096, "Blend (4K-8192K, CPU + RAM cycling)"),
+        "avx": FFTConfig(4, 8192, 4096, "Blend (4K-8192K, CPU + RAM cycling)"),
+        "avx2": FFTConfig(4, 8192, 4096, "Blend (4K-8192K, CPU + RAM cycling)"),
+        "avx512": FFTConfig(4, 8192, 4096, "Blend (4K-8192K, CPU + RAM cycling)"),
+    },
 }
+
+FFT_PRESETS: dict[str, FFTConfig] = {k: v["avx2"] for k, v in FFT_PRESET_MATRIX.items()}
+
+RANGE_PATTERN = re.compile(r"^(\d+)[kK]?\s*-\s*(\d+)[kK]?$")
+
+
+def parse_fft_size_k(fft_name: str) -> int:
+    """Parses FFT size in K from string like '36K', '4M', '40'."""
+    s = fft_name.strip().upper()
+    if s.endswith("M"):
+        return int(float(s[:-1]) * 1024)
+    if s.endswith("K"):
+        return int(s[:-1])
+    return int(s)
+
+
+def build_fft_config(
+    preset_or_range: str,
+    min_fft: int | None = None,
+    max_fft: int | None = None,
+    memory: int | None = None,
+    mode: str = "avx2",
+) -> FFTConfig:
+    """Builds an FFTConfig from a preset alias, range string, or explicit bounds."""
+    if min_fft is not None or max_fft is not None or memory is not None:
+        effective_min = min_fft if min_fft is not None else 4
+        effective_max = max_fft if max_fft is not None else 4
+        effective_mem = memory if memory is not None else 0
+        desc = f"Custom {effective_min}K-{effective_max}K (Mem: {effective_mem}MB)"
+        return FFTConfig(effective_min, effective_max, effective_mem, desc)
+
+    match = RANGE_PATTERN.match(preset_or_range.strip())
+    if match:
+        rmin = int(match.group(1))
+        rmax = int(match.group(2))
+        return FFTConfig(rmin, rmax, 0, f"Range {rmin}K-{rmax}K (in-place)")
+
+    preset = preset_or_range.lower()
+    mode_key = (mode or "avx2").lower()
+    if preset in FFT_PRESET_MATRIX:
+        mode_matrix = FFT_PRESET_MATRIX[preset]
+        if mode_key in mode_matrix:
+            return mode_matrix[mode_key]
+        return mode_matrix.get("avx2", mode_matrix["sse"])
+
+    return FFT_PRESET_MATRIX["smallest"].get(mode_key, FFT_PRESET_MATRIX["smallest"]["sse"])
+
 
 PASSED_PATTERN = re.compile(
     r"Self-test\s+(\d+[kKmM]?)(?:\s*\(thread\s+(\d+)\s+of\s+(\d+)\))?\s+passed!",
@@ -90,17 +157,74 @@ class Prime95Runner(StressRunner):
     def add_cli_arguments(cls, parser: argparse.ArgumentParser) -> None:
         """Registers Prime95 specific CLI arguments."""
         group = parser.add_argument_group("Prime95 Specific Options")
-        group.add_argument("--fft", type=str, default="smallest", choices=list(FFT_PRESETS.keys()), help="FFT preset")
+        group.add_argument(
+            "--fft",
+            type=str,
+            default="smallest",
+            help="FFT preset ('smallest', 'small', 'large', 'blend') or range (e.g. '36-248', default: 'smallest')",
+        )
         group.add_argument("--min-fft", type=int, default=None, help="Custom minimum FFT size in K")
         group.add_argument("--max-fft", type=int, default=None, help="Custom maximum FFT size in K")
         group.add_argument("--memory", type=int, default=None, help="Memory in MB for torture test (0 = in-place)")
         group.add_argument("--test-time", type=int, default=1, help="Prime95 TortureTime in minutes (default: 1)")
         group.add_argument("--mprime", type=str, default=None, help="Path to mprime binary")
 
-    def write_config(self, work_dir: str, fft_cfg: FFTConfig, num_threads: int, test_time_min: int) -> None:
-        """Generates prime.txt configuration ensuring single worker, error checks, and ISO timestamps."""
+        group.add_argument(
+            "--mode",
+            type=str.lower,
+            choices=["sse", "avx", "avx2", "avx512"],
+            default=None,
+            help="Instruction set mode: 'sse', 'avx', 'avx2', 'avx512' (default: auto)",
+        )
+
+    def write_config(
+        self,
+        work_dir: str,
+        fft_cfg: FFTConfig,
+        num_threads: int,
+        test_time_min: int,
+        mode: str | None = None,
+    ) -> None:
+        """Generates prime.txt and local.txt configuration ensuring single worker, error checks, and ISO timestamps."""
         prime_txt = os.path.join(work_dir, "prime.txt")
+        local_txt = os.path.join(work_dir, "local.txt")
         ht_val = 1 if num_threads > 1 else 0
+
+        mode_lines: list[str] = []
+        m = (mode or "").lower()
+        if m == "sse":
+            mode_lines = [
+                "CpuSupportsAVX=0",
+                "CpuSupportsAVX2=0",
+                "CpuSupportsAVX512F=0",
+                "CpuSupportsFMA3=0",
+                "CpuSupportsFMA4=0",
+            ]
+        elif m == "avx":
+            mode_lines = [
+                "CpuSupportsAVX=1",
+                "CpuSupportsAVX2=0",
+                "CpuSupportsAVX512F=0",
+                "CpuSupportsFMA3=0",
+                "CpuSupportsFMA4=0",
+            ]
+        elif m == "avx2":
+            mode_lines = [
+                "CpuSupportsAVX=1",
+                "CpuSupportsAVX2=1",
+                "CpuSupportsAVX512F=0",
+                "CpuSupportsFMA3=1",
+                "CpuSupportsFMA4=0",
+            ]
+        elif m == "avx512":
+            mode_lines = [
+                "CpuSupportsAVX=1",
+                "CpuSupportsAVX2=1",
+                "CpuSupportsAVX512F=1",
+                "CpuSupportsFMA3=1",
+            ]
+
+        mode_block = ("\n".join(mode_lines) + "\n") if mode_lines else ""
 
         content = (
             "StressTester=1\n"
@@ -112,6 +236,7 @@ class Prime95Runner(StressRunner):
             f"TortureMem={fft_cfg.mem_mb}\n"
             f"TortureTime={test_time_min}\n"
             "TortureWeak=0\n"
+            f"{mode_block}"
             "ErrorCheck=1\n"
             "SumInputsErrorCheck=1\n"
             "NumWorkers=1\n"
@@ -128,6 +253,10 @@ class Prime95Runner(StressRunner):
         )
         with open(prime_txt, "w", encoding="utf-8") as f:
             f.write(content)
+
+        if mode_lines:
+            with open(local_txt, "w", encoding="utf-8") as f:
+                f.write("\n".join(mode_lines) + "\n")
 
     def run_test(
         self,
@@ -151,6 +280,8 @@ class Prime95Runner(StressRunner):
                 "fft_preset": legacy_kwargs.get("fft_preset", "smallest"),
                 "test_time_min": legacy_kwargs.get("test_time_min", 1),
                 "custom_fft": legacy_kwargs.get("custom_fft"),
+                "fft_config": legacy_kwargs.get("fft_config"),
+                "mode": legacy_kwargs.get("mode"),
             }
             req = TestRequest(
                 cpus=cpus,
@@ -163,28 +294,29 @@ class Prime95Runner(StressRunner):
         if not self.is_available():
             raise FileNotFoundError(f"mprime binary not found: {self.mprime_bin}")
 
-        # Resolve FFT configuration
-        custom = req.parameters.get("custom_fft")
+        test_time_min = req.parameters.get("test_time_min", 1)
+        mode = req.parameters.get("mode")
+
+        # Resolve FFT configuration (pure range API)
+        custom = req.parameters.get("fft_config") or req.parameters.get("custom_fft")
         if isinstance(custom, FFTConfig):
             fft_cfg = custom
         elif isinstance(custom, dict):
             fft_cfg = FFTConfig(
                 min_fft=custom.get("min_fft", 4),
-                max_fft=custom.get("max_fft", 4),
+                max_fft=custom.get("max_fft", 21),
                 mem_mb=custom.get("mem_mb", 0),
                 desc=custom.get("desc", "Custom FFT"),
             )
         else:
             preset_name = req.parameters.get("fft_preset", "smallest")
-            fft_cfg = FFT_PRESETS.get(preset_name, FFT_PRESETS["smallest"])
-
-        test_time_min = req.parameters.get("test_time_min", 1)
+            fft_cfg = build_fft_config(preset_name, mode=mode or "avx2")
 
         run_id = f"prime_{int(time.time() * 1000)}_{os.getpid()}"
         work_dir = os.path.join(self.base_work_dir, run_id)
         os.makedirs(work_dir, exist_ok=True)
 
-        self.write_config(work_dir, fft_cfg, num_threads=len(req.cpus), test_time_min=test_time_min)
+        self.write_config(work_dir, fft_cfg, num_threads=len(req.cpus), test_time_min=test_time_min, mode=mode)
 
         # Elevate current Python process to SCHED_RR priority 50 if root
         is_root = os.geteuid() == 0
@@ -198,6 +330,7 @@ class Prime95Runner(StressRunner):
         active_errors: list[str] = []
         idle_mce_errors: list[MceEvent] = []
         verified_ffts: list[str] = []
+        current_set_sizes: list[int] = []
         completed_tests = 0
         num_threads = max(1, len(req.cpus))
         thread_completed: dict[int, int] = {t: 0 for t in range(1, num_threads + 1)}
@@ -286,17 +419,36 @@ class Prime95Runner(StressRunner):
                                 if m_pass:
                                     fft_name = m_pass.group(1)
                                     thread_idx_str = m_pass.group(2)
+                                    step_passed_for_all = False
                                     if thread_idx_str is not None:
                                         t_idx = int(thread_idx_str)
                                         thread_completed[t_idx] = thread_completed.get(t_idx, 0) + 1
-                                        completed_iterations = min(thread_completed.values())
+                                        new_iter = min(thread_completed.values())
+                                        if new_iter > raw_single_count:
+                                            raw_single_count = new_iter
+                                            step_passed_for_all = True
                                     else:
                                         raw_single_count += 1
-                                        completed_iterations = raw_single_count // num_threads
+                                        step_passed_for_all = (raw_single_count % num_threads) == 0
 
-                                    if completed_iterations > completed_tests:
-                                        completed_tests = completed_iterations
+                                    if step_passed_for_all:
                                         verified_ffts.append(fft_name)
+                                        size_k = parse_fft_size_k(fft_name)
+                                        is_single_fft = fft_cfg.min_fft == fft_cfg.max_fft
+
+                                        if is_single_fft:
+                                            completed_tests += 1
+                                        else:
+                                            if current_set_sizes and size_k < max(current_set_sizes):
+                                                completed_tests += 1
+                                                current_set_sizes.clear()
+
+                                            current_set_sizes.append(size_k)
+
+                                            if size_k >= fft_cfg.max_fft:
+                                                completed_tests += 1
+                                                current_set_sizes.clear()
+
                                         if listener:
                                             listener.on_test_verified(fft_name, completed_tests)
 
@@ -407,7 +559,7 @@ class Prime95Runner(StressRunner):
             status = "IDLE_MCE_ERROR"
             passed = False
             err_msg = f"Idle core crash: {idle_mce_errors[0].message}"
-        elif completed_tests == 0 and not stopping:
+        elif not verified_ffts and not stopping:
             status = "UNVERIFIED"
             passed = False
             err_msg = "Process ended before completing any verified self-tests"

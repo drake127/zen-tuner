@@ -11,28 +11,13 @@ import datetime
 import os
 import sys
 
+from lib.cpu import detect_cpu_instruction_sets, get_default_instruction_set
 from lib.orchestrator import ZenTunerOrchestrator
 from lib.smu import RyzenSmuMonitor
 from lib.topology import discover_topology, parse_core_selection
 from lib.tui import CursesPresenter
 from lib.ui import Logger
-from runners import FFT_PRESETS, FFTConfig, Prime95Runner, get_runner, parse_time
-
-
-def build_fft_config(
-    preset_name: str,
-    min_fft: int | None = None,
-    max_fft: int | None = None,
-    memory: int | None = None,
-) -> FFTConfig:
-    """Builds an FFTConfig from a preset or custom FFT bounds."""
-    if min_fft is not None or max_fft is not None or memory is not None:
-        effective_min = min_fft if min_fft is not None else 4
-        effective_max = max_fft if max_fft is not None else 4
-        effective_mem = memory if memory is not None else 0
-        desc = f"Custom {effective_min}K-{effective_max}K (Mem: {effective_mem}MB)"
-        return FFTConfig(effective_min, effective_max, effective_mem, desc)
-    return FFT_PRESETS.get(preset_name, FFT_PRESETS["smallest"])
+from runners import FFTConfig, Prime95Runner, build_fft_config, get_runner, parse_time
 
 
 def main() -> None:
@@ -112,11 +97,28 @@ def main() -> None:
     runner = get_runner(args.runner, mprime_path=getattr(args, "mprime", None))
 
     # Engine specific parameters (e.g. FFT configuration for Prime95)
-    fft_cfg = build_fft_config(args.fft, args.min_fft, args.max_fft, args.memory)
+    supported_modes = detect_cpu_instruction_sets()
+    default_mode = get_default_instruction_set(supported_modes)
+    req_mode = getattr(args, "mode", None)
+    if req_mode:
+        mode_val = req_mode.lower()
+        if mode_val not in supported_modes:
+            print(
+                f"[WARNING] Requested instruction mode '{mode_val}' is not supported by CPU "
+                f"(supported: {sorted(supported_modes)}).",
+                file=sys.stderr,
+            )
+    else:
+        mode_val = default_mode
+
+    fft_cfg = build_fft_config(args.fft, args.min_fft, args.max_fft, args.memory, mode=mode_val)
+    profile_desc = f"{fft_cfg.desc} [{mode_val.upper()}]"
     runner_params = {
         "fft_preset": args.fft,
+        "fft_config": fft_cfg,
         "custom_fft": fft_cfg,
         "test_time_min": getattr(args, "test_time", 1),
+        "mode": mode_val,
     }
 
     with Logger(log_file) as logger, RyzenSmuMonitor() as smu_monitor:
@@ -132,7 +134,7 @@ def main() -> None:
                 duration=duration,
                 runner_name=runner.name,
                 hyperthreading_mode=args.hyperthreading,
-                profile_info=fft_cfg.desc,
+                profile_info=profile_desc,
                 tests_target=target_tests,
                 cycles=args.cycles,
                 graceful=True,

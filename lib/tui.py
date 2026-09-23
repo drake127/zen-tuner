@@ -229,6 +229,7 @@ class CursesPresenter(TestEventListener):
 
     def print_banner(self, **kwargs) -> None:
         self.ht_mode = kwargs.get("hyperthreading_mode", "on")
+        self.profile_info = kwargs.get("profile_info")
         self.start()
 
     def print_cycle_start(self, cycle_num: int, total_cycles: int) -> None:
@@ -463,7 +464,8 @@ class CursesPresenter(TestEventListener):
 
     def _draw_header(self, max_x: int) -> None:
         # Title bar
-        title = "Zen Tuner"
+        prof = getattr(self, "profile_info", None)
+        title = f"Zen Tuner  [{prof}]" if prof and len(f"Zen Tuner  [{prof}]") < max_x - 4 else "Zen Tuner"
         self._safe_addstr(0, (max_x - len(title)) // 2, title, curses.A_BOLD | curses.A_REVERSE)
 
         # Execution stats bar

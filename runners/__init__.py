@@ -5,7 +5,7 @@ Pluggable stress runner engine registry and exports.
 from typing import Dict, List, Type
 
 from .base import StressRunner, TestEventListener, parse_time
-from .prime95 import FFT_PRESETS, FFTConfig, Prime95Runner
+from .prime95 import FFT_PRESET_MATRIX, FFT_PRESETS, FFTConfig, Prime95Runner, build_fft_config
 
 _RUNNER_REGISTRY: Dict[str, Type[StressRunner]] = {
     "prime95": Prime95Runner,
@@ -32,6 +32,8 @@ __all__ = [
     "Prime95Runner",
     "FFTConfig",
     "FFT_PRESETS",
+    "FFT_PRESET_MATRIX",
+    "build_fft_config",
     "parse_time",
     "get_runner",
     "list_runners",
