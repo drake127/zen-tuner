@@ -6,7 +6,8 @@ import curses
 
 import pytest
 
-from lib.models import CoreSmuMetrics, PackageSmuMetrics, PhysicalCore, SmuSnapshot
+from conftest import make_metrics, make_result, make_sample, make_snapshot
+from lib.models import CoreSmuMetrics, FailedRun, PhysicalCore, RunStatus
 from lib.presenter import SessionInfo
 from lib.tui import CursesPresenter
 from lib.ui import Logger
@@ -46,20 +47,7 @@ class FakeScreen:
 
 
 def slot(core_idx, slot_idx, ccd_idx=0, enabled=True, **overrides) -> CoreSmuMetrics:
-    values = dict(core_idx=core_idx, slot_idx=slot_idx, ccd_idx=ccd_idx, is_enabled=enabled, voltage_v=1.35,
-                  power_w=15.25, temp_c=65.0, frequency_mhz=4850.0, effective_mhz=4650.0, c0_pct=99.0,
-                  c1_pct=1.0, c6_pct=0.0, co_offset=-25)
-    return CoreSmuMetrics(**(values | overrides))
-
-
-def snapshot(slots: list[CoreSmuMetrics]) -> SmuSnapshot:
-    package = PackageSmuMetrics(
-        socket_power_w=75.0, package_temp_c=70.0, ppt_w=75.0, ppt_limit_w=142.0, tdc_a=45.0, tdc_limit_a=95.0,
-        edc_a=80.0, edc_limit_a=140.0, soc_voltage_v=0.9750, vddp_voltage_v=0.8471, vddg_ccd_voltage_v=0.8471,
-        vddg_iod_voltage_v=0.8973,
-    )
-    return SmuSnapshot(cores={s.core_idx: s for s in slots if s.is_enabled}, package=package, pm_version=0x380805,
-                       slots=slots)
+    return make_metrics(core_idx=core_idx, slot_idx=slot_idx, ccd_idx=ccd_idx, is_enabled=enabled, **overrides)
 
 
 @pytest.fixture
@@ -73,18 +61,20 @@ def cores() -> list[PhysicalCore]:
 
 @pytest.fixture
 def presenter(cores):
-    p = CursesPresenter(cores, session=SessionInfo(profile="Smallest FFTs", hyperthreading_mode="cycle",
-                                                   target_iterations=2, total_cycles=3))
+    p = CursesPresenter(cores)
+    p.on_session_start(SessionInfo(profile="Smallest FFTs", hyperthreading_mode="cycle", target_iterations=2,
+                                   total_cycles=3))
     p._stdscr = FakeScreen()
     yield p
     p._stdscr = None
 
 
 def test_render_with_smu(presenter, cores):
-    presenter.last_smu_snapshot = snapshot([slot(0, 0), slot(None, 1, enabled=False), slot(1, 2), slot(2, 8, ccd_idx=1)])
+    presenter.last_smu_snapshot = make_snapshot([slot(0, 0), slot(None, 1, enabled=False), slot(1, 2), slot(2, 8, ccd_idx=1)])
     presenter.stats[1].passes = 3
-    presenter.on_cycle_start(2, 3, "prime95")
+    presenter.on_cycle_start(2, "prime95")
     presenter.on_core_start(2, cores[0], "Phase 2/3: 1T (CPU 12)")
+    presenter.on_telemetry_sample(make_sample(4850.0, 4650.0))
     presenter._render()
     screen = presenter._stdscr.text()
 
@@ -93,13 +83,13 @@ def test_render_with_smu(presenter, cores):
     assert "Testing: Core 0 (Phase 2/3: 1T (CPU 12))" in screen
     assert "PPT: 75.00/142W (53%)" in screen
     assert "VDDG IOD: 0.8973V" in screen
-    for text in ("Core Status   Pass   CO", "C6%", "── CCD 0", "── CCD 1", "DISABLED", "ACTIVE", "-25", "15.25W",
+    for text in ("Core Status   Pass  Drop   CO", "C6%", "── CCD 0", "── CCD 1", "DISABLED", "ACTIVE", "-25", "15.25W",
                  "-200M", "Starting Cycle 2 of 3 [prime95]"):
         assert text in screen
 
 
 def test_render_without_smu(presenter):
-    presenter.stats[0].failures = 1
+    presenter.stats[0].failed_runs.append(FailedRun(1, "prime95", make_result(RunStatus.ERROR)))
     presenter._render()
     screen = presenter._stdscr.text()
     assert "ryzen_smu telemetry not available" in screen
@@ -130,7 +120,7 @@ def test_emit_logs_and_marks_dirty(tmp_path, cores):
         presenter._dirty = False
         presenter.on_output_line("\033[32mWorker starting\033[0m")
     assert presenter._dirty
-    assert presenter.log[-1] == ("Worker starting", Tone.DEFAULT)
+    assert presenter.log.view(1)[0] == [("Worker starting", Tone.DEFAULT)]
     assert (tmp_path / "session.log").read_text() == "Worker starting\n"
 
 

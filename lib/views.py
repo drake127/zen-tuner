@@ -6,11 +6,8 @@ Turns cores, statistics and SMU metrics into formatted, tone-annotated table cel
 from dataclasses import dataclass
 from enum import Enum
 
-from lib.models import STRETCH_NOISE_MHZ, STRETCH_THRESHOLD_MHZ, CoreSmuMetrics, CoreStats, PhysicalCore
+from lib.models import CoreSmuMetrics, CoreStats, MceEvent, PhysicalCore, STRETCH_THRESHOLD_MHZ
 from lib.ui import BOLD, CYAN, DIM, GREEN, MAGENTA, RED, RESET, WHITE, YELLOW
-
-# C0 residency above which a live clock drop of the active core is meaningful.
-LIVE_DROP_C0_PCT_MIN = 90.0
 
 
 class Tone(Enum):
@@ -57,20 +54,21 @@ class CoreRow:
     is_disabled: bool = False
 
 
+# Result columns (Status, Pass, Drop) come first; the remaining live columns show current SMU readings.
 LIVE_COLUMNS_WIDE = (
-    Column("Core", 4), Column("Status", 8, "<"), Column("Pass", 4), Column("CO", 4), Column("Volt", 6),
-    Column("Power", 6), Column("Temp", 5), Column("Clock", 5), Column("Target", 6), Column("Drop", 5),
+    Column("Core", 4), Column("Status", 8, "<"), Column("Pass", 4), Column("Drop", 5), Column("CO", 4),
+    Column("Volt", 6), Column("Power", 6), Column("Temp", 5), Column("Clock", 5), Column("Target", 6),
     Column("C0%", 4), Column("C1%", 4), Column("C6%", 4),
 )
 LIVE_COLUMNS_NARROW = (
-    Column("Core", 4), Column("Status", 8, "<"), Column("Pass", 4), Column("Volt", 6), Column("Power", 6),
+    Column("Core", 4), Column("Status", 8, "<"), Column("Pass", 4), Column("Drop", 5), Column("Volt", 6),
     Column("Temp", 5), Column("Clock", 5), Column("C0%", 4), Column("C1%", 4), Column("C6%", 4),
 )
 BASIC_COLUMNS = (Column("Core", 4), Column("Status", 8, "<"), Column("Pass", 4), Column("Fail", 4))
 SUMMARY_COLUMNS = (
     Column("Core", 4), Column("CCD", 6, "^"), Column("CO", 5), Column("Volt", 7), Column("Power", 7),
     Column("Temp", 5), Column("Eff MHz", 8), Column("Tgt MHz", 8), Column("Drop", 6), Column("Pass", 4),
-    Column("Fail", 4), Column("Status", 14, "<"),
+    Column("Fail", 4), Column("Status", 8, "<"),
 )
 
 
@@ -102,8 +100,12 @@ def fmt_co(co_offset: int | None) -> str:
     return f"{co_offset:+d}" if co_offset is not None else "--"
 
 
+def ccd_index(core: PhysicalCore) -> int:
+    return core.ccd_id if core.ccd_id is not None else 0
+
+
 def ccd_label(core: PhysicalCore) -> str:
-    return f"CCD {core.ccd_id if core.ccd_id is not None else 0}"
+    return f"CCD {ccd_index(core)}"
 
 
 def rank_tone(core: PhysicalCore | None) -> Tone | None:
@@ -119,21 +121,25 @@ def core_label(core_idx: int, ranked: bool) -> str:
     return f"* {core_idx:>2d}" if core_idx < 100 else f"*{core_idx:>3d}"
 
 
-def core_status(stats: CoreStats, is_active: bool) -> tuple[str, Tone]:
+def core_status(stats: CoreStats, is_active: bool = False, final: bool = False) -> tuple[str, Tone]:
+    """Status label of a core; final=True labels cores that never ran as SKIPPED instead of IDLE."""
     if is_active:
         return "ACTIVE", Tone.ACTIVE
     if stats.failures > 0:
         return f"FAIL({stats.failures})", Tone.FAIL
     if stats.passes > 0:
-        return "PASS", Tone.PASS
-    return "IDLE", Tone.DEFAULT
+        return ("STRETCH", Tone.WARN) if stats.stretching_detected else ("PASS", Tone.PASS)
+    return ("SKIPPED", Tone.DISABLED) if final else ("IDLE", Tone.DEFAULT)
 
 
-def live_stretch_mhz(metrics: CoreSmuMetrics) -> float:
-    if metrics.c0_pct < LIVE_DROP_C0_PCT_MIN:
-        return 0.0
-    drop = metrics.frequency_mhz - metrics.effective_mhz
-    return drop if drop > STRETCH_NOISE_MHZ else 0.0
+def describe_mce(event: MceEvent) -> str:
+    """Location of a hardware error, e.g. 'CPU 13 (Core 1) while testing Core 1'."""
+    where = f"CPU {event.cpu}" if event.cpu is not None else "CPU ?"
+    if event.core_idx is not None:
+        where += f" (Core {event.core_idx})"
+    if event.tested_core_idx is not None:
+        where += f" while testing Core {event.tested_core_idx}"
+    return where
 
 
 def live_core_row(
@@ -141,32 +147,31 @@ def live_core_row(
     core: PhysicalCore | None,
     stats: CoreStats | None,
     is_active: bool,
+    run_stretch_mhz: float | None = None,
 ) -> CoreRow:
-    """Row of the live telemetry table for one PM table slot."""
+    """
+    Row of the live telemetry table for one PM table slot. All columns show current SMU readings except the
+    results: Drop is the median clock drop of the current run (active core) or of the worst finished run.
+    """
     if not metrics.is_enabled or metrics.core_idx is None or stats is None:
         return CoreRow(cells={"Core": "-", "Status": "DISABLED"}, status_tone=Tone.DISABLED, is_disabled=True)
 
     ranked = rank_tone(core)
     status, tone = core_status(stats, is_active)
-    summary = stats.telemetry
-    if is_active:
-        target, drop = f"{metrics.frequency_mhz:.0f}", fmt_drop(live_stretch_mhz(metrics))
-    elif summary is not None:
-        target, drop = f"{summary.target_mhz:.0f}", fmt_drop(summary.stretch_mhz)
-    else:
-        target, drop = f"{metrics.frequency_mhz:.0f}", "--"
+    finished = stats.telemetry
+    drop = run_stretch_mhz if is_active else (finished.stretch_mhz if finished else None)
 
     cells = {
         "Core": core_label(metrics.core_idx, ranked is not None),
         "Status": status,
         "Pass": str(stats.passes),
+        "Drop": fmt_drop(drop),
         "CO": fmt_co(metrics.co_offset),
         "Volt": f"{metrics.voltage_v:5.3f}V",
         "Power": f"{metrics.power_w:5.2f}W",
         "Temp": f"{metrics.temp_c:3.0f}°C",
         "Clock": f"{metrics.effective_mhz:.0f}",
-        "Target": target,
-        "Drop": drop,
+        "Target": f"{metrics.frequency_mhz:.0f}",
         "C0%": f"{metrics.c0_pct:3.0f}%",
         "C1%": f"{metrics.c1_pct:3.0f}%",
         "C6%": f"{metrics.c6_pct:3.0f}%",
@@ -193,22 +198,15 @@ def _ansi(text: str, tone: Tone | None, bold: bool = False) -> str:
     return f"{prefix}{text}{RESET}" if prefix else text
 
 
-def render_summary(
-    cores: list[PhysicalCore],
-    stats: dict[int, CoreStats],
-    co_offsets: dict[int, int] | None = None,
-) -> list[str]:
-    """Renders the end-of-session summary table as ANSI-coloured lines."""
-    co_offsets = co_offsets or {}
+def _summary_table(cores: list[PhysicalCore], stats: dict[int, CoreStats], co_offsets: dict[int, int]) -> list[str]:
     inner = [f" {col.fmt(col.header)} " for col in SUMMARY_COLUMNS]
     box_w = len("║".join(inner))
-    sep = "═" * box_w
 
     def rule(left: str, mid: str, right: str) -> str:
         return left + mid.join("═" * len(cell) for cell in inner) + right
 
     lines = [
-        _ansi(f"╔{sep}╗", Tone.ACTIVE, bold=True),
+        _ansi(f"╔{'═' * box_w}╗", Tone.ACTIVE, bold=True),
         _ansi(f"║{'CYCLE SUMMARY RESULTS':^{box_w}}║", Tone.ACTIVE, bold=True),
         _ansi(rule("╠", "╦", "╣"), Tone.ACTIVE, bold=True),
         _ansi("║" + "║".join(inner) + "║", Tone.ACTIVE, bold=True),
@@ -225,16 +223,9 @@ def render_summary(
             lines.append("║" + _ansi(title[:box_w], Tone.HEADER, bold=True) + "║")
 
         summary = st.telemetry
-        stretched = st.stretching_detected
-        if st.failures:
-            status, status_tone = f"FAIL ({st.failures})", Tone.FAIL
-        elif st.passes:
-            status, status_tone = ("PASS (STRETCH)", Tone.WARN) if stretched else ("PASS", Tone.PASS)
-        else:
-            status, status_tone = "SKIPPED", Tone.DISABLED
-
+        status, status_tone = core_status(st, final=True)
         ranked = rank_tone(core)
-        clock_tone = Tone.WARN if stretched else None
+        clock_tone = Tone.WARN if st.stretching_detected else None
         cells: dict[str, tuple[str, Tone | None]] = {
             "Core": (core_label(core.core_idx, ranked is not None), None),
             "CCD": (ccd, None),
@@ -267,13 +258,45 @@ def render_summary(
         f"Duration: {sum(s.total_duration for s in stats.values()) / 60.0:.1f}m"
     )
     lines.append(_ansi(f"{totals:^{box_w + 2}}", None, bold=True))
-
-    mce_lines = [(core, ev) for core in cores for ev in stats[core.core_idx].mce_events]
-    if mce_lines:
-        lines.append("")
-        lines.append(_ansi(f"Hardware errors reported by the kernel during the session ({len(mce_lines)}):", Tone.FAIL,
-                           bold=True))
-        for core, ev in mce_lines:
-            cpu = f"CPU {ev.cpu}" if ev.cpu is not None else "CPU ?"
-            lines.append(_ansi(f"  [while testing Core {core.core_idx}] {cpu}: {ev.message}", Tone.FAIL))
     return lines
+
+
+def _failures_section(cores: list[PhysicalCore], stats: dict[int, CoreStats]) -> list[str]:
+    failed = [(core, run) for core in cores for run in stats[core.core_idx].failed_runs]
+    if not failed:
+        return []
+    lines = ["", _ansi(f"Failures ({len(failed)}):", Tone.FAIL, bold=True)]
+    for core, run in failed:
+        result = run.result
+        lines.append(_ansi(
+            f"  Core {core.core_idx} - cycle {run.cycle_num}, {run.runner_name}: {result.status}: {result.error_message}",
+            Tone.FAIL, bold=True,
+        ))
+        if result.work_dir:
+            lines.append(f"    Work directory: {result.work_dir}")
+        lines.append(f"    Engine output ({len(result.output)} lines):")
+        lines.extend(f"    | {line}" for line in result.output)
+    return lines
+
+
+def _mce_section(mce_events: list[MceEvent]) -> list[str]:
+    if not mce_events:
+        return []
+    lines = ["", _ansi(f"Hardware errors reported by the kernel during the session ({len(mce_events)}):", Tone.FAIL,
+                       bold=True)]
+    lines.extend(_ansi(f"  {describe_mce(ev)}: {ev.message}", Tone.FAIL) for ev in mce_events)
+    return lines
+
+
+def render_summary(
+    cores: list[PhysicalCore],
+    stats: dict[int, CoreStats],
+    co_offsets: dict[int, int] | None = None,
+    mce_events: list[MceEvent] | None = None,
+) -> list[str]:
+    """Renders the end-of-session summary as ANSI-coloured lines: result table, failures and hardware errors."""
+    return (
+        _summary_table(cores, stats, co_offsets or {})
+        + _failures_section(cores, stats)
+        + _mce_section(mce_events or [])
+    )

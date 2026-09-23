@@ -14,6 +14,11 @@ STRETCH_NOISE_MHZ: float = 5.0
 # Median clock drop at or above this value is reported as clock stretching.
 STRETCH_THRESHOLD_MHZ: float = 50.0
 
+# A core counts as fully loaded at a boost clock only above these values; target vs. effective clock differences
+# under lighter load are meaningless.
+LOAD_C0_PCT_MIN: float = 95.0
+LOAD_FREQ_MHZ_MIN: float = 2500.0
+
 
 @dataclass(frozen=True)
 class PhysicalCore:
@@ -38,9 +43,11 @@ class RunStatus(StrEnum):
 @dataclass(frozen=True)
 class MceEvent:
     """Hardware Machine Check Exception or Hardware Error line captured from kernel logs."""
-    cpu: int | None
+    cpu: int | None  # logical CPU named by the kernel line, if any
     message: str
-    on_tested_cpu: bool | None  # None when the kernel line does not identify the CPU
+    timestamp_s: float | None = None  # kernel log timestamp in seconds since boot (see monitors.kernel_clock)
+    core_idx: int | None = None  # physical core owning cpu
+    tested_core_idx: int | None = None  # core under test (or last tested) when the event was logged
 
 
 @dataclass(frozen=True)
@@ -57,11 +64,23 @@ class TelemetrySample:
         drop = self.target_mhz - self.effective_mhz
         return drop if drop > STRETCH_NOISE_MHZ else 0.0
 
+    @classmethod
+    def from_metrics(cls, metrics: "CoreSmuMetrics") -> "TelemetrySample | None":
+        """Sample of a core's PM table metrics, or None when the core is not fully loaded at a boost clock."""
+        if not metrics.is_enabled or metrics.c0_pct < LOAD_C0_PCT_MIN or metrics.frequency_mhz < LOAD_FREQ_MHZ_MIN:
+            return None
+        return cls(
+            target_mhz=metrics.frequency_mhz,
+            effective_mhz=metrics.effective_mhz,
+            voltage_v=metrics.voltage_v,
+            power_w=metrics.power_w,
+            temp_c=metrics.temp_c,
+        )
+
 
 @dataclass(frozen=True)
 class TelemetrySummary:
     """Median telemetry of a single test run; medians suppress transient spikes (e.g. FFT size switches)."""
-    samples: int
     target_mhz: float
     effective_mhz: float
     stretch_mhz: float
@@ -79,7 +98,6 @@ class TelemetrySummary:
         if not samples:
             return None
         return cls(
-            samples=len(samples),
             target_mhz=statistics.median(s.target_mhz for s in samples),
             effective_mhz=statistics.median(s.effective_mhz for s in samples),
             stretch_mhz=statistics.median(s.stretch_mhz for s in samples),
@@ -94,31 +112,38 @@ class TelemetrySummary:
 class RunResult:
     """Outcome and telemetry for a single core stress test execution."""
     status: RunStatus
-    tested_cpus: list[int]
     completed_iterations: int
     elapsed_seconds: float
     error_message: str | None = None
-    errors: list[str] = field(default_factory=list)
-    mce_events: list[MceEvent] = field(default_factory=list)
-    verified_steps: list[str] = field(default_factory=list)
-    summary_line: str | None = None
     telemetry: TelemetrySummary | None = None
+    output: list[str] = field(default_factory=list)  # cleaned engine output of the run
+    work_dir: str | None = None  # kept engine work directory of a failed run
 
     @property
     def passed(self) -> bool:
         return self.status == RunStatus.PASS
 
 
+@dataclass(frozen=True)
+class FailedRun:
+    """A failed core run together with the context it ran in."""
+    cycle_num: int
+    runner_name: str
+    result: RunResult
+
+
 @dataclass
 class CoreStats:
     """Aggregated test execution statistics for a physical core across cycle runs."""
     passes: int = 0
-    failures: int = 0
     verified_iterations: int = 0
     total_duration: float = 0.0
-    errors: list[str] = field(default_factory=list)
-    mce_events: list[MceEvent] = field(default_factory=list)
+    failed_runs: list[FailedRun] = field(default_factory=list)
     runs_telemetry: list[TelemetrySummary] = field(default_factory=list)
+
+    @property
+    def failures(self) -> int:
+        return len(self.failed_runs)
 
     @property
     def telemetry(self) -> TelemetrySummary | None:

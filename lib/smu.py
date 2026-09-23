@@ -400,7 +400,6 @@ class RyzenSmuMonitor:
     """
 
     def __init__(self, sysfs_dir: str = SYSFS_SMU_DIR, core_count: int | None = None, min_interval: float = 0.25):
-        self.sysfs_dir = sysfs_dir
         self.core_count = core_count
         self.min_interval = min_interval
         self.pm_path = os.path.join(sysfs_dir, "pm_table")
@@ -448,8 +447,8 @@ class RyzenSmuMonitor:
                 time.sleep(0.005)
                 f_cmd.seek(0)
 
-    def send_smu_command(self, op: int, *args: int, timeout_s: float = 0.2) -> tuple[int, ...] | None:
-        """Sends an MP1 mailbox command (up to 6 arguments) via sysfs and returns the response arguments."""
+    def _send_smu_command(self, op: int, *args: int, timeout_s: float = 0.2) -> tuple[int, ...] | None:
+        """Sends an MP1 mailbox command (up to 6 arguments) and returns the response arguments. Caller holds _lock."""
         if not (os.path.isfile(self.mp1_path) and os.path.isfile(self.smu_args_path)):
             return None
         payload = list(args) + [0] * (6 - len(args))
@@ -469,13 +468,13 @@ class RyzenSmuMonitor:
             pass
         return None
 
-    def read_co_offset(self, slot_idx: int) -> int | None:
-        """Reads the Curve Optimizer offset of a physical core slot, or None if unsupported on this generation."""
+    def _read_co_offset(self, slot_idx: int) -> int | None:
+        """Reads the Curve Optimizer offset of a physical core slot, or None if unsupported. Caller holds _lock."""
         layout = self.layout
         if layout is None or layout.co_margin_op is None:
             return None
         core_mask = ((slot_idx & 8) << 5 | (slot_idx & 7)) << 20
-        resp = self.send_smu_command(layout.co_margin_op, core_mask)
+        resp = self._send_smu_command(layout.co_margin_op, core_mask)
         if not resp:
             return None
         val = resp[0] - 0x100000000 if resp[0] > 0x7FFFFFFF else resp[0]
@@ -485,15 +484,14 @@ class RyzenSmuMonitor:
         if self._co_offsets is None:
             self._co_offsets = {}
             for slot in range(PM_TABLE_CORE_SLOTS):
-                val = self.read_co_offset(slot)
+                val = self._read_co_offset(slot)
                 if val is not None:
                     self._co_offsets[slot] = val
         return self._co_offsets
 
     def read_snapshot(self) -> SmuSnapshot | None:
         """Returns the current parsed PM table (cached for min_interval seconds), or None if unavailable."""
-        version = self.get_pm_version()
-        if version is None or get_smu_table_offsets(version) is None:
+        if self.layout is None:
             return None
 
         with self._lock:
@@ -508,7 +506,7 @@ class RyzenSmuMonitor:
                 return None
             if not raw:
                 return None
-            snapshot = parse_pm_table_buffer(version, raw, core_count=self.core_count,
+            snapshot = parse_pm_table_buffer(self.get_pm_version(), raw, core_count=self.core_count,
                                              co_offsets=self._read_co_offsets_locked())
             self._cached_snapshot = snapshot
             self._cached_at = now

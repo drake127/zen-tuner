@@ -295,7 +295,6 @@ def test_prime95_errors(listener):
     parser = prime95_parser(listener, FFTConfig(4, 21, 0, ""))
     feed(parser, ["[2026-09-23T15:01:48] Torture Test completed 3 tests in 3 minutes - 0 errors, 0 warnings."])
     assert parser.errors == []
-    assert "Torture Test completed" in parser.summary_line
 
     feed(parser, ["[2026-09-23T15:02:00] FATAL ERROR: Rounding was 0.5, expected less than 0.4",
                   "[2026-09-23T15:02:01] Torture Test completed 3 tests in 3 minutes - 1 errors, 0 warnings."])
@@ -347,8 +346,7 @@ def scripted(runner_cls: type, script: str, **kwargs):
         def _prepare(self, request: TestRequest, work_dir: str) -> list[str]:
             return [sys.executable, "-u", "-c", textwrap.dedent(script)]
 
-    binary_kw = "mprime_path" if runner_cls is Prime95Runner else "binary_path"
-    return ScriptedRunner(**{binary_kw: sys.executable}, **kwargs)
+    return ScriptedRunner(binary_path=sys.executable, **kwargs)
 
 
 # Mimics y-cruncher: ignores SIGINT, runs forever until SIGTERM
@@ -376,7 +374,7 @@ PRIME95_SCRIPT = """
 """
 
 
-def test_y_cruncher_stopped_after_last_iteration(no_kmsg, listener):
+def test_y_cruncher_stopped_after_last_iteration(listener):
     result = run(scripted(YCruncherRunner, Y_CRUNCHER_SCRIPT.format(passes=2)), YC_PARAMS, listener, target=2)
     assert result.status == RunStatus.PASS
     assert result.completed_iterations == 2
@@ -385,11 +383,12 @@ def test_y_cruncher_stopped_after_last_iteration(no_kmsg, listener):
     assert result.elapsed_seconds < 5.0
 
 
-def test_prime95_stopped_after_last_iteration(no_kmsg, listener):
+def test_prime95_stopped_after_last_iteration(listener):
     result = run(scripted(Prime95Runner, PRIME95_SCRIPT.format(passes=1)), PRIME95_PARAMS, listener)
     assert result.status == RunStatus.PASS
-    # Output printed while stopping is still parsed
-    assert "0 errors" in result.summary_line
+    # Output printed while stopping is still collected
+    assert result.output[-1] == "Torture Test completed 1 tests in 1 minutes - 0 errors, 0 warnings."
+    assert result.work_dir is None
 
 
 @pytest.mark.parametrize(
@@ -397,7 +396,7 @@ def test_prime95_stopped_after_last_iteration(no_kmsg, listener):
     [(YCruncherRunner, Y_CRUNCHER_SCRIPT, YC_PARAMS), (Prime95Runner, PRIME95_SCRIPT, PRIME95_PARAMS)],
     ids=["y-cruncher", "prime95"],
 )
-def test_cancel_interrupts_run(no_kmsg, listener, runner_cls, script, params):
+def test_cancel_interrupts_run(listener, runner_cls, script, params):
     context = RunContext()
     threading.Timer(0.3, context.cancel.set).start()
     result = run(scripted(runner_cls, script.format(passes=0)), params, listener, context=context)
@@ -416,20 +415,20 @@ def test_cancel_interrupts_run(no_kmsg, listener, runner_cls, script, params):
     ],
     ids=["early-exit", "error-before-exit", "signal", "exit-code"],
 )
-def test_exit_classification(no_kmsg, listener, script, status, message):
+def test_exit_classification(listener, script, status, message):
     result = run(scripted(Prime95Runner, script), PRIME95_PARAMS, listener, target=2)
     assert result.status == status
     assert message in result.error_message
 
 
-def test_y_cruncher_config_error(no_kmsg, listener):
+def test_y_cruncher_config_error(listener):
     # Observed y-cruncher reaction to an unknown test name: message and exit code 0
     script = 'print("Exception Encountered: InvalidParametersException"); print("Unknown Test: FOO")'
     result = run(scripted(YCruncherRunner, script), YC_PARAMS, listener)
     assert result.status == RunStatus.ERROR
 
 
-def test_stop_escalates_to_sigkill(no_kmsg, listener, monkeypatch):
+def test_stop_escalates_to_sigkill(listener, monkeypatch):
     monkeypatch.setattr("runners.base.STOP_TIMEOUT_S", 0.3)
     script = """
         import signal, time
@@ -443,7 +442,7 @@ def test_stop_escalates_to_sigkill(no_kmsg, listener, monkeypatch):
     assert result.status == RunStatus.PASS
 
 
-def test_child_inherits_affinity_in_own_process_group(no_kmsg, listener):
+def test_child_inherits_affinity_in_own_process_group(listener):
     script = """
         import os
         print("affinity", sorted(os.sched_getaffinity(0)))
@@ -458,33 +457,24 @@ def test_child_inherits_affinity_in_own_process_group(no_kmsg, listener):
     assert os.sched_getaffinity(0) == before
 
 
-def test_hardware_errors_are_reported_without_failing(tmp_path, monkeypatch, listener):
-    fifo = tmp_path / "kmsg"
-    os.mkfifo(fifo)
-    monkeypatch.setattr("lib.monitors.KMSG_PATH", str(fifo))
-    record = f"0,1,2,-;mce: [Hardware Error]: CPU {ONE_CPU[0]}: Machine Check: 0 Bank 5: bea0000000000108"
-    script = f"""
-        import time
-        with open({str(fifo)!r}, "w") as kmsg:
-            kmsg.write({record!r} + "\\n")
-        time.sleep(0.3)
-        print("Self-test 4K passed!")
-    """
-    result = run(scripted(Prime95Runner, script), PRIME95_PARAMS, listener)
-    assert result.status == RunStatus.PASS
-    assert len(result.mce_events) == 1
-    assert result.mce_events[0].on_tested_cpu
-    assert listener.hardware_errors == result.mce_events
-
-
-def test_work_dir_kept_only_on_failure(tmp_path, no_kmsg, listener):
+def test_work_dir_kept_only_on_failure(tmp_path, listener):
     run(scripted(Prime95Runner, 'print("Self-test 4K passed!")', base_work_dir=str(tmp_path)), PRIME95_PARAMS, listener)
     assert os.listdir(tmp_path) == []
-    run(scripted(Prime95Runner, 'print("FATAL ERROR: x")', base_work_dir=str(tmp_path)), PRIME95_PARAMS, listener)
-    assert len(os.listdir(tmp_path)) == 1
+    for script in ('print("FATAL ERROR: x")', "raise SystemExit(3)", "pass"):
+        result = run(scripted(Prime95Runner, script, base_work_dir=str(tmp_path)), PRIME95_PARAMS, listener)
+        assert result.status != RunStatus.PASS
+        assert os.path.dirname(result.work_dir) == str(tmp_path)
+    assert len(os.listdir(tmp_path)) == 3
+
+
+def test_failed_run_carries_full_output(listener):
+    script = 'print("Worker starting"); print("Unexpected message"); raise SystemExit(3)'
+    result = run(scripted(Prime95Runner, script), PRIME95_PARAMS, listener)
+    assert result.status == RunStatus.CRASH
+    assert result.output == ["Worker starting", "Unexpected message"]
 
 
 def test_unavailable_binary():
-    runner = Prime95Runner(mprime_path="/nonexistent/mprime")
+    runner = Prime95Runner(binary_path="/nonexistent/mprime")
     with pytest.raises(RunnerUnavailableError):
         runner.run_test(TestRequest(cpus=ONE_CPU, parameters=PRIME95_PARAMS))

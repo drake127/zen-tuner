@@ -12,7 +12,7 @@ import os
 import sys
 
 from lib.orchestrator import HYPERTHREADING_MODES, ZenTunerOrchestrator
-from lib.presenter import ConsolePresenter, SessionInfo
+from lib.presenter import ConsolePresenter
 from lib.smu import RyzenSmuMonitor
 from lib.topology import TopologyError, discover_topology, parse_core_selection
 from lib.tui import CursesPresenter
@@ -106,16 +106,10 @@ def main() -> None:
     log_dir = args.log_dir or os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
     log_file = os.path.join(log_dir, f"zen_tuner_{ts}.log")
 
-    session = SessionInfo(
-        profile=" / ".join(e.profile for e in engines),
-        hyperthreading_mode=args.hyperthreading,
-        target_iterations=args.test_iterations,
-        total_cycles=args.cycles,
-    )
     presenter_cls = CursesPresenter if sys.stdout.isatty() and sys.stdin.isatty() else ConsolePresenter
 
     with Logger(log_file) as logger, RyzenSmuMonitor(core_count=len(all_cores)) as smu_monitor:
-        with presenter_cls(all_cores, session=session, logger=logger, smu_monitor=smu_monitor) as presenter:
+        with presenter_cls(all_cores, logger=logger, smu_monitor=smu_monitor) as presenter:
             orchestrator = ZenTunerOrchestrator(engines, all_cores, presenter=presenter, smu_monitor=smu_monitor)
             try:
                 stats = orchestrator.run(

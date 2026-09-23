@@ -10,11 +10,11 @@ import argparse
 from dataclasses import dataclass
 import os
 import re
-import shutil
 import signal
 
+from lib.events import TestEventListener
 from lib.models import TestRequest
-from runners.base import OutputParser, StressRunner, TestEventListener, parse_duration
+from runners.base import OutputParser, StressRunner, parse_duration
 
 # Stress test components accepted by y-cruncher (see contrib/y-cruncher/Command Lines.txt)
 VALID_ALGORITHMS = ("BKT", "BBP", "SFTv4", "SNT", "SVT", "FFTv4", "NTT63", "N63", "VSTv3", "VT3")
@@ -31,11 +31,11 @@ DEFAULT_MEMORY_2T = 26567600
 
 PASSED_PATTERN = re.compile(r"Running\s+([A-Za-z0-9_]+):\s+Passed", re.IGNORECASE)
 FAILED_PATTERN = re.compile(r"Running\s+([A-Za-z0-9_]+):\s+Failed", re.IGNORECASE)
+# Only "Exception Encountered" was observed on the bundled build (invalid configuration). Any other failure makes
+# y-cruncher stop on its own (StopOnError), which ends the run as UNVERIFIED with the full engine output reported.
 ERROR_PATTERNS = [
     re.compile(r"Stress test failed with\s+(\d+)\s+error", re.IGNORECASE),
     re.compile(r"Exception Encountered:\s*(\w+)", re.IGNORECASE),
-    re.compile(r"FATAL ERROR.*", re.IGNORECASE),
-    re.compile(r"Hardware failure detected.*", re.IGNORECASE),
 ]
 
 
@@ -84,39 +84,20 @@ class YCruncherOutputParser(OutputParser):
 
         m = PASSED_PATTERN.search(line)
         if m:
-            completes = (len(self.verified_steps) + 1) % self.algorithm_count == 0
-            self.step_verified(m.group(1), completes)
-            if completes:
-                self.summary_line = f"{self.completed_iterations} iterations of {self.algorithm_count} algorithms"
+            self.step_verified(m.group(1), (self.steps_verified + 1) % self.algorithm_count == 0)
 
 
 class YCruncherRunner(StressRunner):
     """y-cruncher stress test runner implementation."""
 
     name = "y-cruncher"
+    # The launcher selects the CPU-tuned binary from Binaries/ itself.
+    bundled_binary = "contrib/y-cruncher/y-cruncher"
+    binary_name = "y-cruncher"
     # y-cruncher ignores SIGINT while stress testing; SIGTERM ends it immediately.
     stop_signal = signal.SIGTERM
     # Output is not flushed line by line when stdout is a pipe.
     use_pty = True
-
-    def __init__(self, binary_path: str | None = None, base_work_dir: str | None = None):
-        super().__init__(base_work_dir)
-        self.y_cruncher_bin = self._resolve_binary(binary_path)
-
-    def is_available(self) -> bool:
-        return self.y_cruncher_bin is not None and os.access(self.y_cruncher_bin, os.X_OK)
-
-    @staticmethod
-    def _resolve_binary(binary_path: str | None = None) -> str | None:
-        """Resolves the y-cruncher launcher, which selects the CPU-tuned binary from Binaries/ itself."""
-        if binary_path:
-            return os.path.abspath(binary_path)
-        candidate = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "contrib/y-cruncher/y-cruncher"
-        )
-        if os.access(candidate, os.X_OK):
-            return candidate
-        return shutil.which("y-cruncher")
 
     @classmethod
     def add_cli_arguments(cls, parser: argparse.ArgumentParser) -> None:
@@ -192,7 +173,7 @@ class YCruncherRunner(StressRunner):
 
     def _prepare(self, request: TestRequest, work_dir: str) -> list[str]:
         cfg_path = self.write_config(work_dir, request.cpus, request.parameters)
-        return [self.y_cruncher_bin, "pause:-2", "skip-warnings", "colors:0", "status:none", "config", cfg_path]
+        return [self.binary, "pause:-2", "skip-warnings", "colors:0", "status:none", "config", cfg_path]
 
     def _create_parser(self, request: TestRequest, work_dir: str, listener: TestEventListener) -> OutputParser:
         params: YCruncherParams = request.parameters

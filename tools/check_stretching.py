@@ -16,7 +16,6 @@ from lib.monitors import CoreTelemetryMonitor
 from lib.smu import RyzenSmuMonitor
 from lib.topology import discover_topology
 from lib.ui import RESET, YELLOW
-from lib.views import fmt_drop
 
 
 def main() -> None:
@@ -39,14 +38,14 @@ def main() -> None:
 
         print(f"Monitoring Core {args.core} for {args.duration:.1f}s (interval {args.interval}s, "
               f"threshold {args.threshold} MHz). Samples are taken only under full load (C0 >= 95%).")
-        mon = CoreTelemetryMonitor(smu, args.core, threshold_mhz=args.threshold, sample_interval=args.interval)
+        mon = CoreTelemetryMonitor(smu, args.core, sample_interval=args.interval)
         start = time.monotonic()
         while time.monotonic() - start < args.duration:
-            alert = mon.poll()
-            if alert:
+            sample = mon.poll()
+            if sample and sample.stretch_mhz >= args.threshold:
                 print(
-                    f"[{YELLOW}ALERT{RESET}] Core {args.core}: Target {alert.target_mhz:.0f} MHz vs "
-                    f"Effective {alert.effective_mhz:.0f} MHz (Drop: -{alert.stretch_mhz:.0f} MHz)"
+                    f"[{YELLOW}ALERT{RESET}] Core {args.core}: Target {sample.target_mhz:.0f} MHz vs "
+                    f"Effective {sample.effective_mhz:.0f} MHz (Drop: -{sample.stretch_mhz:.0f} MHz)"
                 )
             time.sleep(args.interval / 4.0)
 
@@ -54,8 +53,8 @@ def main() -> None:
     print("\nSummary:")
     print(f"Samples under load: {len(mon.samples)}")
     if summary:
-        print(f"Median drop: {fmt_drop(summary.stretch_mhz)} | Max drop: {summary.max_stretch_mhz:.0f} MHz | "
-              f"Stretching detected: {summary.stretching_detected}")
+        print(f"Median drop: {summary.stretch_mhz:.0f} MHz | Max drop: {summary.max_stretch_mhz:.0f} MHz | "
+              f"Stretching detected: {summary.stretch_mhz >= args.threshold}")
 
 
 if __name__ == "__main__":

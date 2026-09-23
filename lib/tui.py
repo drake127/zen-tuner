@@ -16,7 +16,7 @@ import traceback
 
 from lib.logbuffer import LogBuffer
 from lib.models import PhysicalCore, SmuSnapshot
-from lib.presenter import Presenter, SessionInfo
+from lib.presenter import Presenter
 from lib.smu import RyzenSmuMonitor
 from lib.ui import Logger
 from lib.views import (
@@ -27,6 +27,7 @@ from lib.views import (
     CoreRow,
     Tone,
     basic_core_row,
+    ccd_index,
     column_offset,
     header_line,
     join_cells,
@@ -56,12 +57,11 @@ class CursesPresenter(Presenter):
     def __init__(
         self,
         all_cores: list[PhysicalCore],
-        session: SessionInfo | None = None,
         logger: Logger | None = None,
         smu_monitor: RyzenSmuMonitor | None = None,
         refresh_interval: float = 1.0,
     ):
-        super().__init__(all_cores, session=session, logger=logger, smu_monitor=smu_monitor)
+        super().__init__(all_cores, logger=logger, smu_monitor=smu_monitor)
         self.refresh_interval = max(0.1, refresh_interval)
         self.log = LogBuffer()
         self.last_smu_snapshot: SmuSnapshot | None = None
@@ -365,19 +365,18 @@ class CursesPresenter(Presenter):
 
         if snap is not None and snap.slots:
             columns = LIVE_COLUMNS_WIDE if len(header_line(LIVE_COLUMNS_WIDE)) <= width - 2 else LIVE_COLUMNS_NARROW
-            core_map = {c.core_idx: c for c in self.all_cores}
             active_idx = self.current_core.core_idx if self.current_core else None
+            run_stretch = self.current_stretch_mhz
             entries = [
-                (sm.ccd_idx, live_core_row(sm, core_map.get(sm.core_idx), self.stats.get(sm.core_idx),
-                                           sm.core_idx is not None and sm.core_idx == active_idx))
+                (sm.ccd_idx, live_core_row(sm, self.core_by_idx.get(sm.core_idx), self.stats.get(sm.core_idx),
+                                           sm.core_idx is not None and sm.core_idx == active_idx, run_stretch))
                 for sm in snap.slots
             ]
         else:
             columns = BASIC_COLUMNS
-            active = self.current_core
+            active_idx = self.current_core.core_idx if self.current_core else None
             entries = [
-                (c.ccd_id if c.ccd_id is not None else 0,
-                 basic_core_row(c, self.stats[c.core_idx], active is not None and active.core_idx == c.core_idx))
+                (ccd_index(c), basic_core_row(c, self.stats[c.core_idx], c.core_idx == active_idx))
                 for c in self.all_cores
             ]
 

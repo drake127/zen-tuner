@@ -2,7 +2,7 @@
 Pluggable stress runner engine registry and exports.
 """
 
-from .base import Engine, RunContext, RunnerUnavailableError, StressRunner, TestEventListener, parse_duration
+from .base import Engine, RunContext, RunnerUnavailableError, StressRunner, parse_duration
 from .prime95 import FFT_PRESETS, FFTConfig, Prime95Runner, build_fft_config
 from .y_cruncher import ALGORITHM_PRESETS, YCruncherRunner
 
@@ -27,7 +27,6 @@ __all__ = [
     "RunContext",
     "RunnerUnavailableError",
     "StressRunner",
-    "TestEventListener",
     "YCruncherRunner",
     "build_fft_config",
     "get_runner",

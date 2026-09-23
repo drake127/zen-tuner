@@ -191,27 +191,27 @@ def test_fused_off_core_slot_mapping():
 def test_co_offset_mailbox_query(smu_sysfs):
     mon = RyzenSmuMonitor(sysfs_dir=smu_sysfs(PM_VER_ZEN3_VERMEER_1, ZEN3_V1_BUFFER))
     # Mailbox response for -25 is encoded as (1 << 32) - 25
-    mon.send_smu_command = MagicMock(return_value=((1 << 32) - 25, 0, 0, 0, 0, 0))
-    assert mon.read_co_offset(0) == -25
-    mon.send_smu_command.assert_called_once_with(MP1_ZEN3_GET_DLDO_PSM_MARGIN, 0)
+    mon._send_smu_command = MagicMock(return_value=((1 << 32) - 25, 0, 0, 0, 0, 0))
+    assert mon._read_co_offset(0) == -25
+    mon._send_smu_command.assert_called_once_with(MP1_ZEN3_GET_DLDO_PSM_MARGIN, 0)
 
     # Slot 8 (CCD 1): ((8 & 8) << 5 | (8 & 7)) << 20 = 0x10000000
-    mon.send_smu_command.reset_mock()
-    mon.read_co_offset(8)
-    mon.send_smu_command.assert_called_once_with(MP1_ZEN3_GET_DLDO_PSM_MARGIN, 0x10000000)
+    mon._send_smu_command.reset_mock()
+    mon._read_co_offset(8)
+    mon._send_smu_command.assert_called_once_with(MP1_ZEN3_GET_DLDO_PSM_MARGIN, 0x10000000)
 
 
 def test_co_offset_not_queried_on_zen2(smu_sysfs):
     mon = RyzenSmuMonitor(sysfs_dir=smu_sysfs(PM_VER_ZEN2_MATISSE, ZEN3_V1_BUFFER))
-    mon.send_smu_command = MagicMock()
-    assert mon.read_co_offset(0) is None
-    mon.send_smu_command.assert_not_called()
+    mon._send_smu_command = MagicMock()
+    assert mon._read_co_offset(0) is None
+    mon._send_smu_command.assert_not_called()
 
 
 def test_co_offsets_by_core_uses_slot_mapping(smu_sysfs):
     mon = RyzenSmuMonitor(sysfs_dir=smu_sysfs(PM_VER_ZEN3_VERMEER_1, ZEN3_V1_BUFFER), core_count=2)
-    mon.read_co_offset = MagicMock(side_effect=lambda slot: {0: -20, 1: -15}.get(slot))
+    mon._read_co_offset = MagicMock(side_effect=lambda slot: {0: -20, 1: -15}.get(slot))
     assert mon.co_offsets_by_core() == {0: -20, 1: -15}
     # Offsets are read once for all 16 slots and cached
     mon.read_snapshot()
-    assert mon.read_co_offset.call_count == 16
+    assert mon._read_co_offset.call_count == 16

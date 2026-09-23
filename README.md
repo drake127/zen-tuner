@@ -11,10 +11,10 @@
 ## Key Features
 
 - **AMD Ryzen SMU PM Table Integration**: Directly interfaces with the `ryzen_smu` kernel driver (`/sys/kernel/ryzen_smu_drv/pm_table`) to read real-time per-core VDDCR voltage, power consumption (W), temperature (°C), effective clock, C-states (`C0 %`, `C6 %`), and socket PBO limits (PPT, TDC, EDC), with auto-detection of enabled physical slots on multi-CCD chips (filtering out fused-off silicon cores).
-- **Split-Screen Ncurses TUI Dashboard**: Real-time terminal interface displaying cycle summary and PBO gauges at the top, live scrolling test log on the left, and per-core telemetry table (including Curve Optimizer offsets on Zen 3) on the right. Without an interactive terminal (pipe, redirect) the log is printed as plain lines instead.
-- **Clock Stretching Detection**: Compares the SMU-reported core clock with the effective clock while the tested core is fully loaded (C0 ≥ 95 %). A median drop of 50 MHz or more over a run is reported as stretching. Without `ryzen_smu` the clock columns show `--`, since APERF/MPERF alone cannot tell stretching apart from a lower boost clock.
+- **Split-Screen Ncurses TUI Dashboard**: Real-time terminal interface displaying cycle summary and PBO gauges at the top, live scrolling test log on the left, and per-core telemetry table (including Curve Optimizer offsets on Zen 3) on the right. The table shows live SMU readings; only the result columns (Status, Pass, Drop) describe test runs. Without an interactive terminal (pipe, redirect) the log is printed as plain lines instead.
+- **Clock Stretching Detection**: Compares the SMU-reported core clock with the effective clock while the tested core is fully loaded (C0 ≥ 95 % at 2500 MHz or more). A median drop of 50 MHz or more over a run is reported as stretching; the Drop column shows the median of the run in progress for the active core and of the worst finished run for the others. Without `ryzen_smu` the clock columns show `--`, since APERF/MPERF alone cannot tell stretching apart from a lower boost clock.
 - **Pluggable Stress Runner Architecture**: Runners only describe how to configure an engine and parse its output (`StressRunner` + `OutputParser`); process supervision, stop signals, telemetry and exit classification are shared.
-- **Hardware Error Logging**: Watches the kernel ring buffer (`/dev/kmsg`) for Machine Check / `[Hardware Error]` records and reports them prominently in the log and the final summary. They do not fail a core yet.
+- **Hardware Error Logging**: Watches the kernel ring buffer (`/dev/kmsg`) for Machine Check / `[Hardware Error]` records during the whole session and reports them prominently in the log and the final summary. Each record is attributed by its kernel timestamp to the core under test at that time (records logged between runs go to the run that started last), and by the CPU it names to the physical core owning that CPU. Hardware errors do not fail a core yet; without root access the kernel log cannot be read and a notice says so.
 - **Real-Time Priority (`SCHED_RR`)**: Controller thread runs at `SCHED_RR` priority 50 unpinned; the stress process inherits priority 40 and the target core affinity at spawn time, before it starts any threads.
 
 ---
@@ -27,11 +27,12 @@ zen-tuner/
 ├── lib/                          # Internal core logic and infrastructure
 │   ├── __init__.py
 │   ├── cpu.py                    # Instruction set detection from /proc/cpuinfo
+│   ├── events.py                 # Runner → presenter event contract (TestEventListener)
 │   ├── models.py                 # Pure dataclasses (PhysicalCore, CoreStats, RunResult, SmuSnapshot, etc.)
 │   ├── smu.py                    # AMD Ryzen SMU PM Table parser & sysfs reader (Zen 1-3)
 │   ├── sched.py                  # SCHED_RR / CPU affinity helpers
 │   ├── topology.py               # CPU topology discovery from sysfs & core selection parser
-│   ├── monitors.py               # SMU core telemetry sampling & /dev/kmsg hardware error monitor
+│   ├── monitors.py               # SMU core telemetry sampling & session-wide /dev/kmsg hardware error monitor
 │   ├── orchestrator.py           # ZenTunerOrchestrator: engine-agnostic cycling & statistics
 │   ├── presenter.py              # Presenter base (event messages, summary) & ConsolePresenter
 │   ├── views.py                  # View models shared by the dashboard and the summary table
@@ -40,7 +41,7 @@ zen-tuner/
 │   └── ui.py                     # Session log file, ANSI colours & terminal utilities
 ├── runners/                      # Pluggable stress runner engines
 │   ├── __init__.py               # Runner registry (RUNNER_CLASSES, get_runner)
-│   ├── base.py                   # StressRunner, OutputParser, process supervision, TestEventListener
+│   ├── base.py                   # StressRunner plugin interface, OutputParser, process supervision
 │   ├── prime95.py                # Prime95 (mprime) implementation & FFT profiles
 │   └── y_cruncher.py             # y-cruncher implementation & algorithm profiles
 ├── tools/                        # Standalone diagnostic utilities
@@ -118,12 +119,20 @@ Each core run ends with one of these results:
 | Result | Meaning |
 | :--- | :--- |
 | `PASS` | All requested iterations were verified by the engine. |
-| `ERROR` | The engine reported a computation error (e.g. Prime95 rounding / hardware failure, y-cruncher failed test). |
+| `ERROR` | The engine reported a computation error (e.g. Prime95 rounding / hardware failure, y-cruncher failed test or exception). |
 | `CRASH` | The engine terminated abnormally (signal or non-zero exit code). |
-| `UNVERIFIED` | The engine ended before verifying all requested iterations. |
+| `UNVERIFIED` | The engine ended before verifying all requested iterations (e.g. y-cruncher stopping on an error it reported in a format Zen Tuner does not recognize). |
 | `INTERRUPTED` | Stopped by the user; not counted as a failure. |
 
-A failed core is skipped in later cycles. The summary table marks cores with a median clock drop of 50 MHz or more as `PASS (STRETCH)` and lists all kernel hardware errors recorded during the session. The session log is written to `logs/zen_tuner_<timestamp>.log`; the engine's work directory (configuration, `results.txt`) is kept in the system temp directory for failed runs. The exit code is `0` when no core failed, `1` otherwise.
+A failed core is skipped in later cycles. The summary at the end of the session consists of:
+
+- the result table, where passed cores with a median clock drop of 50 MHz or more are marked `STRETCH`;
+- **Failures**: every failed run with its cycle, engine, result and message, the kept engine work directory (configuration, `results.txt`) and the complete engine output of that run, so failures are diagnosable even when their message is not recognized;
+- **Hardware errors** reported by the kernel during the session with their attribution.
+
+The session log is written to `logs/zen_tuner_<timestamp>.log` and contains the complete session including the summary.
+
+Exit codes: `0` no core failed, `1` at least one core failed, `2` invalid command-line arguments, `130` aborted by a second `Ctrl+C`.
 
 ---
 

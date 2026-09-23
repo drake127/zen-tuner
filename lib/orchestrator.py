@@ -1,15 +1,18 @@
 """
 Zen Tuner multi-core stress testing orchestrator.
-Manages cycle iterations, SMT thread strategies, signal handling, and statistics accumulation.
+Manages cycle iterations, SMT thread strategies, signal handling, hardware error attribution and statistics.
 Independent of the underlying stress engine.
 """
 
+import bisect
 from collections.abc import Sequence
+import dataclasses
 import signal
 import threading
 
-from lib.models import CoreStats, PhysicalCore, RunResult, RunStatus, TestRequest
-from lib.presenter import Presenter
+from lib.models import CoreStats, FailedRun, MceEvent, PhysicalCore, RunResult, RunStatus, TestRequest
+from lib.monitors import KernelErrorMonitor, kernel_clock
+from lib.presenter import Presenter, SessionInfo
 from lib.sched import CONTROLLER_RT_PRIORITY, thread_rt_priority
 from lib.smu import RyzenSmuMonitor
 from runners.base import Engine, RunContext
@@ -27,6 +30,7 @@ class ZenTunerOrchestrator:
         all_cores: list[PhysicalCore],
         presenter: Presenter | None = None,
         smu_monitor: RyzenSmuMonitor | None = None,
+        kmsg_path: str | None = None,
     ):
         if not engines:
             raise ValueError("At least one stress engine is required")
@@ -34,9 +38,16 @@ class ZenTunerOrchestrator:
         self.all_cores = all_cores
         self.presenter = presenter or Presenter(all_cores)
         self.smu_monitor = smu_monitor
+        self.kmsg_path = kmsg_path
         self.stats: dict[int, CoreStats] = {c.core_idx: CoreStats() for c in all_cores}
         self.presenter.attach_stats(self.stats)
+        self.mce_events: list[MceEvent] = []
         self.cancel = threading.Event()
+        self._cpu_to_core = {cpu: c.core_idx for c in all_cores for cpu in c.logical_cpus}
+        # Start times (kernel_clock) and cores of all runs in order; shared with the kernel monitor thread.
+        self._run_starts: list[float] = []
+        self._run_cores: list[int] = []
+        self._timeline_lock = threading.Lock()
 
     def _handle_stop_signal(self, signum, frame) -> None:
         # Runs in the main thread between arbitrary bytecodes: only flag the request, never take presenter locks.
@@ -44,6 +55,29 @@ class ZenTunerOrchestrator:
         if self.cancel.is_set():
             raise KeyboardInterrupt
         self.cancel.set()
+
+    def _record_run_start(self, core_idx: int) -> None:
+        with self._timeline_lock:
+            self._run_starts.append(kernel_clock())
+            self._run_cores.append(core_idx)
+
+    def _on_kernel_event(self, event: MceEvent) -> None:
+        """
+        Attributes a kernel hardware error by its own timestamp and CPU (called from the monitor thread).
+        Errors logged between runs are attributed to the run that started last, since the kernel may report
+        them with a delay after the error occurred.
+        """
+        timestamp = event.timestamp_s if event.timestamp_s is not None else kernel_clock()
+        with self._timeline_lock:
+            pos = bisect.bisect_right(self._run_starts, timestamp)
+            tested = self._run_cores[pos - 1] if pos else None
+            event = dataclasses.replace(
+                event,
+                core_idx=self._cpu_to_core.get(event.cpu) if event.cpu is not None else None,
+                tested_core_idx=tested,
+            )
+            self.mce_events.append(event)
+        self.presenter.on_hardware_error(event)
 
     def run(
         self,
@@ -62,10 +96,19 @@ class ZenTunerOrchestrator:
         if target_iterations < 1:
             raise ValueError(f"Target iterations must be at least 1: {target_iterations}")
 
+        self.presenter.on_session_start(SessionInfo(
+            profile=" / ".join(e.profile for e in self.engines),
+            hyperthreading_mode=hyperthreading_mode,
+            target_iterations=target_iterations,
+            total_cycles=cycles,
+        ))
         old_handlers = {sig: signal.signal(sig, self._handle_stop_signal) for sig in STOP_SIGNALS}
         context = RunContext(listener=self.presenter, cancel=self.cancel, smu_monitor=self.smu_monitor)
         try:
-            with thread_rt_priority(CONTROLLER_RT_PRIORITY):
+            with KernelErrorMonitor(self._on_kernel_event, self.kmsg_path) as kernel_mon, \
+                    thread_rt_priority(CONTROLLER_RT_PRIORITY):
+                if not kernel_mon.available:
+                    self.presenter.on_notice(f"{kernel_mon.kmsg_path} is not readable; hardware errors are not monitored.")
                 self._run_cycles(selected_cores, target_iterations, hyperthreading_mode, cycles, continue_on_error,
                                  context)
             if self.cancel.is_set():
@@ -73,7 +116,9 @@ class ZenTunerOrchestrator:
         finally:
             for sig, handler in old_handlers.items():
                 signal.signal(sig, handler)
-            self.presenter.on_session_end(selected_cores, self.stats)
+            with self._timeline_lock:
+                mce_events = list(self.mce_events)
+            self.presenter.on_session_end(selected_cores, self.stats, mce_events)
 
         return self.stats
 
@@ -93,7 +138,7 @@ class ZenTunerOrchestrator:
                 return
 
             engine = self.engines[(cycle_num - 1) % len(self.engines)]
-            self.presenter.on_cycle_start(cycle_num, cycles, engine.runner.name)
+            self.presenter.on_cycle_start(cycle_num, engine.runner.name)
 
             for core in selected_cores:
                 if self.cancel.is_set():
@@ -110,8 +155,9 @@ class ZenTunerOrchestrator:
                     core_idx=core.core_idx,
                     parameters=engine.parameters,
                 )
+                self._record_run_start(core.core_idx)
                 result = engine.runner.run_test(request, context)
-                self._accumulate_stats(core.core_idx, result)
+                self._accumulate_stats(core.core_idx, result, cycle_num, engine.runner.name)
                 self.presenter.on_core_result(core, result)
 
                 if not result.passed and result.status != RunStatus.INTERRUPTED and not continue_on_error:
@@ -135,12 +181,11 @@ class ZenTunerOrchestrator:
             return [cpus[phase]], f"Phase {phase + 1}/3: 1T (CPU {cpus[phase]})"
         return cpus, f"Phase 3/3: 2T (CPUs {cpus[0]}+{cpus[1]})"
 
-    def _accumulate_stats(self, core_idx: int, result: RunResult) -> None:
-        st = self.stats[core_idx]
-        st.mce_events.extend(result.mce_events)
+    def _accumulate_stats(self, core_idx: int, result: RunResult, cycle_num: int, runner_name: str) -> None:
         if result.status == RunStatus.INTERRUPTED:
             return
 
+        st = self.stats[core_idx]
         st.total_duration += result.elapsed_seconds
         st.verified_iterations += result.completed_iterations
         if result.telemetry is not None:
@@ -149,5 +194,4 @@ class ZenTunerOrchestrator:
         if result.passed:
             st.passes += 1
         else:
-            st.failures += 1
-            st.errors.extend(result.errors or [result.error_message or result.status])
+            st.failed_runs.append(FailedRun(cycle_num=cycle_num, runner_name=runner_name, result=result))

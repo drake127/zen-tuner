@@ -1,15 +1,17 @@
 """
 Hardware telemetry and kernel error monitors.
 Samples per-core SMU telemetry under load and watches the kernel kmsg ring buffer for hardware errors.
-Implements context manager protocols with zero terminal output side effects.
 """
 
+from collections.abc import Callable
 import errno
 import os
 import re
+import select
+import threading
 import time
 
-from lib.models import STRETCH_THRESHOLD_MHZ, MceEvent, TelemetrySample, TelemetrySummary
+from lib.models import MceEvent, TelemetrySample, TelemetrySummary
 from lib.smu import RyzenSmuMonitor
 
 KMSG_PATH = "/dev/kmsg"
@@ -20,25 +22,20 @@ KMSG_PATH = "/dev/kmsg"
 MCE_LINE_MARKERS = ("[hardware error]", "machine check")
 MCE_CPU_PATTERN = re.compile(r"\bCPU[:\s]\s*(\d+)\b")
 
-# Telemetry is sampled only when the core is fully loaded at a boost clock; lighter load makes
-# target vs. effective clock differences meaningless.
-LOAD_C0_PCT_MIN = 95.0
-LOAD_FREQ_MHZ_MIN = 2500.0
+KMSG_POLL_INTERVAL_S = 0.2
+
+
+def kernel_clock() -> float:
+    """Seconds on the clock closest to /dev/kmsg timestamps (sched_clock is not NTP-slewed, like MONOTONIC_RAW)."""
+    return time.clock_gettime(time.CLOCK_MONOTONIC_RAW)
 
 
 class CoreTelemetryMonitor:
-    """Samples SMU telemetry of one physical core while it is under full load and flags clock stretching."""
+    """Samples SMU telemetry of one physical core while it is under full load."""
 
-    def __init__(
-        self,
-        smu_monitor: RyzenSmuMonitor,
-        core_idx: int,
-        threshold_mhz: float = STRETCH_THRESHOLD_MHZ,
-        sample_interval: float = 1.0,
-    ):
+    def __init__(self, smu_monitor: RyzenSmuMonitor, core_idx: int, sample_interval: float = 1.0):
         self.smu_monitor = smu_monitor
         self.core_idx = core_idx
-        self.threshold_mhz = threshold_mhz
         self.sample_interval = sample_interval
         self.samples: list[TelemetrySample] = []
         self._last_sample_time = time.monotonic()
@@ -48,7 +45,7 @@ class CoreTelemetryMonitor:
         return TelemetrySummary.from_samples(self.samples)
 
     def poll(self) -> TelemetrySample | None:
-        """Takes a sample when the interval elapsed. Returns it only if its clock drop reaches the threshold."""
+        """Takes a sample when the interval elapsed and the core is fully loaded; returns the new sample."""
         now = time.monotonic()
         if now - self._last_sample_time < self.sample_interval:
             return None
@@ -56,87 +53,102 @@ class CoreTelemetryMonitor:
 
         snapshot = self.smu_monitor.read_snapshot()
         metrics = snapshot.cores.get(self.core_idx) if snapshot else None
-        if metrics is None or metrics.c0_pct < LOAD_C0_PCT_MIN or metrics.frequency_mhz < LOAD_FREQ_MHZ_MIN:
-            return None
+        sample = TelemetrySample.from_metrics(metrics) if metrics else None
+        if sample is not None:
+            self.samples.append(sample)
+        return sample
 
-        sample = TelemetrySample(
-            target_mhz=metrics.frequency_mhz,
-            effective_mhz=metrics.effective_mhz,
-            voltage_v=metrics.voltage_v,
-            power_w=metrics.power_w,
-            temp_c=metrics.temp_c,
-        )
-        self.samples.append(sample)
-        return sample if sample.stretch_mhz >= self.threshold_mhz else None
+
+def parse_kmsg_record(record: str) -> MceEvent | None:
+    """
+    Parses one /dev/kmsg record ("<prio>,<seq>,<usec>,<flags>;<message>") into an MceEvent if it reports a
+    hardware error. The timestamp is the kernel log clock, comparable with kernel_clock().
+    """
+    # Continuation lines carry key=value dictionary entries and start with a space.
+    if record.startswith(" "):
+        return None
+    header, sep, message = record.partition(";")
+    if not sep:
+        header, message = "", record
+    message = message.strip()
+    if not any(marker in message.lower() for marker in MCE_LINE_MARKERS):
+        return None
+
+    fields = header.split(",")
+    timestamp_s = int(fields[2]) / 1e6 if len(fields) > 2 and fields[2].isdigit() else None
+    m = MCE_CPU_PATTERN.search(message)
+    return MceEvent(cpu=int(m.group(1)) if m else None, message=message, timestamp_s=timestamp_s)
 
 
 class KernelErrorMonitor:
-    """Monitors /dev/kmsg for Hardware Errors and Machine Check Exceptions."""
+    """
+    Watches /dev/kmsg for hardware errors for the whole session in a background thread.
+    Only records logged after start() are reported; callback runs in the monitor thread.
+    """
 
-    def __init__(self, tested_cpus: list[int], kmsg_path: str | None = None):
-        self.tested_cpus: set[int] = set(tested_cpus)
-        self.kmsg_fd: int | None = None
-        self._open(kmsg_path or KMSG_PATH)
+    def __init__(self, callback: Callable[[MceEvent], None], kmsg_path: str | None = None):
+        self.callback = callback
+        self.kmsg_path = kmsg_path or KMSG_PATH
+        self.available = False
+        self._fd: int | None = None
+        self._thread: threading.Thread | None = None
+        self._running = False
 
     def __enter__(self) -> "KernelErrorMonitor":
+        self.start()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.close()
 
-    def _open(self, path: str) -> None:
+    def start(self) -> None:
         try:
-            self.kmsg_fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            self._fd = os.open(self.kmsg_path, os.O_RDONLY | os.O_NONBLOCK)
         except OSError:
-            self.kmsg_fd = None
             return
         try:
-            os.lseek(self.kmsg_fd, 0, os.SEEK_END)
+            os.lseek(self._fd, 0, os.SEEK_END)
         except OSError:
             pass
+        self.available = True
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, name="zen-tuner-kmsg", daemon=True)
+        self._thread.start()
 
-    def poll(self) -> list[MceEvent]:
-        """Reads all pending kernel log records and returns new hardware error events."""
-        events: list[MceEvent] = []
-        if self.kmsg_fd is None:
-            return events
+    def _loop(self) -> None:
+        while self._running:
+            ready, _, _ = select.select([self._fd], [], [], KMSG_POLL_INTERVAL_S)
+            if ready:
+                self._read_pending()
 
+    def _read_pending(self) -> None:
         while True:
             try:
-                raw = os.read(self.kmsg_fd, 8192)
+                raw = os.read(self._fd, 8192)
             except BlockingIOError:
-                break
+                return
             except OSError as err:
                 if err.errno == errno.EPIPE:
                     # Records were overwritten in the ring buffer before we read them; the next read resumes.
                     continue
-                break
+                return
             if not raw:
-                break
-            for line in raw.decode("utf-8", errors="replace").splitlines():
-                ev = self.parse_line(line)
-                if ev:
-                    events.append(ev)
-        return events
-
-    def parse_line(self, line: str) -> MceEvent | None:
-        # /dev/kmsg records are "<prio>,<seq>,<ts>,<flags>;<message>"; continuation lines start with a space.
-        if line.startswith(" "):
-            return None
-        _, sep, message = line.partition(";")
-        message = (message if sep else line).strip()
-        lower = message.lower()
-        if not any(marker in lower for marker in MCE_LINE_MARKERS):
-            return None
-
-        m = MCE_CPU_PATTERN.search(message)
-        cpu = int(m.group(1)) if m else None
-        return MceEvent(cpu=cpu, message=message, on_tested_cpu=(cpu in self.tested_cpus) if cpu is not None else None)
+                # A FIFO without writers reports EOF; /dev/kmsg never does.
+                time.sleep(KMSG_POLL_INTERVAL_S)
+                return
+            for record in raw.decode("utf-8", errors="replace").splitlines():
+                event = parse_kmsg_record(record)
+                if event:
+                    self.callback(event)
 
     def close(self) -> None:
-        if self.kmsg_fd is not None:
+        self._running = False
+        if self._thread is not None:
+            self._thread.join()
+            self._thread = None
+        if self._fd is not None:
             try:
-                os.close(self.kmsg_fd)
+                os.close(self._fd)
             except OSError:
                 pass
-            self.kmsg_fd = None
+            self._fd = None

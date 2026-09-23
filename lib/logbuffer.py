@@ -18,13 +18,6 @@ class LogBuffer:
         self._offset = 0
         self._lock = threading.Lock()
 
-    def __len__(self) -> int:
-        return len(self._lines)
-
-    def __getitem__(self, index: int) -> tuple[str, Tone]:
-        with self._lock:
-            return self._lines[index]
-
     def append(self, text: str, tone: Tone = Tone.DEFAULT) -> None:
         with self._lock:
             self._lines.append((strip_ansi(text), tone))

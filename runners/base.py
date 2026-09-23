@@ -1,12 +1,13 @@
 """
-Abstract base class, output parser and event listener protocols for pluggable stress test runners.
-Decouples stress engines (Prime95, y-cruncher, ...) from presentation and orchestration; the common process
-supervision loop (spawn, output parsing, telemetry, kernel error monitoring, stop and exit classification) lives here.
+Stress runner plugin interface and the shared process supervision loop.
+Runners only describe how to configure an engine (_prepare) and how to interpret its output (OutputParser);
+spawning, output reading, telemetry sampling, stopping and exit classification are common to all engines.
 """
 
 import abc
 import argparse
 import codecs
+from collections import deque
 from dataclasses import dataclass, field
 import os
 import pty
@@ -18,56 +19,23 @@ import subprocess
 import tempfile
 import threading
 import time
-from typing import Any, ClassVar, Protocol
+from typing import Any, ClassVar
 
-from lib.models import MceEvent, RunResult, RunStatus, TelemetrySample, TestRequest
-from lib.monitors import CoreTelemetryMonitor, KernelErrorMonitor
+from lib.events import NullListener, TestEventListener
+from lib.models import RunResult, RunStatus, TestRequest
+from lib.monitors import CoreTelemetryMonitor
 from lib.sched import inherited_scheduling
 from lib.smu import RyzenSmuMonitor
 from lib.ui import strip_ansi
 
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 POLL_INTERVAL_S = 0.1
 STOP_TIMEOUT_S = 5.0
 DRAIN_TIMEOUT_S = 1.0
+OUTPUT_HISTORY_LINES = 5000
 
 LINE_SPLIT_PATTERN = re.compile(r"[\r\n]+")
-
-
-class TestEventListener(Protocol):
-    """Callback protocol for receiving real-time events during a test run."""
-    __test__ = False
-
-    def on_output_line(self, line: str) -> None:
-        """Called for every non-empty sanitized output line of the stress process."""
-        ...
-
-    def on_test_verified(self, step_name: str, completed_iterations: int) -> None:
-        """Called when a self-test step is validated by the stress engine."""
-        ...
-
-    def on_stretching_detected(self, sample: TelemetrySample) -> None:
-        """Called when a telemetry sample shows a clock drop above the stretching threshold."""
-        ...
-
-    def on_hardware_error(self, event: MceEvent) -> None:
-        """Called when the kernel reports a hardware error / MCE during the run."""
-        ...
-
-
-class NullListener:
-    """Listener ignoring all events."""
-
-    def on_output_line(self, line: str) -> None:
-        pass
-
-    def on_test_verified(self, step_name: str, completed_iterations: int) -> None:
-        pass
-
-    def on_stretching_detected(self, sample: TelemetrySample) -> None:
-        pass
-
-    def on_hardware_error(self, event: MceEvent) -> None:
-        pass
 
 
 @dataclass
@@ -89,9 +57,9 @@ class OutputParser(abc.ABC):
         self.target_iterations = target_iterations
         self.listener = listener
         self.completed_iterations = 0
-        self.verified_steps: list[str] = []
+        self.steps_verified = 0
         self.errors: list[str] = []
-        self.summary_line: str | None = None
+        self.output: deque[str] = deque(maxlen=OUTPUT_HISTORY_LINES)
 
     @property
     def done(self) -> bool:
@@ -104,6 +72,7 @@ class OutputParser(abc.ABC):
     def handle_line(self, raw_line: str) -> None:
         line = self.clean_line(raw_line)
         if line:
+            self.output.append(line)
             self.listener.on_output_line(line)
             self.feed(line)
 
@@ -122,7 +91,7 @@ class OutputParser(abc.ABC):
             self.errors.append(message)
 
     def step_verified(self, step_name: str, completes_iteration: bool) -> None:
-        self.verified_steps.append(step_name)
+        self.steps_verified += 1
         if completes_iteration:
             self.completed_iterations += 1
         self.listener.on_test_verified(step_name, self.completed_iterations)
@@ -177,18 +146,6 @@ def _signal_group(proc: subprocess.Popen, sig: int) -> None:
         pass
 
 
-def terminate_process(proc: subprocess.Popen, sig: int = signal.SIGTERM, timeout_s: float = STOP_TIMEOUT_S) -> None:
-    """Sends sig to the child's process group and waits; falls back to SIGKILL after timeout_s."""
-    if proc.poll() is not None:
-        return
-    _signal_group(proc, sig)
-    try:
-        proc.wait(timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        _signal_group(proc, signal.SIGKILL)
-        proc.wait()
-
-
 def parse_duration(value: str) -> float:
     """Parses durations like '300', '300s', '5m', '1h' into seconds; a bare number means seconds."""
     text = str(value).strip().lower()
@@ -204,6 +161,13 @@ def parse_duration(value: str) -> float:
     return seconds
 
 
+@dataclass
+class _Supervision:
+    returncode: int | None
+    stop_reason: RunStatus | None
+    elapsed_seconds: float
+
+
 class StressRunner(abc.ABC):
     """
     Base class for stress test execution engines.
@@ -212,17 +176,28 @@ class StressRunner(abc.ABC):
     """
 
     name: ClassVar[str]
+    # Engine binary bundled under contrib/ (relative to the repository root) and its name on PATH as a fallback.
+    bundled_binary: ClassVar[str]
+    binary_name: ClassVar[str]
     # Signal asking the engine to stop gracefully; delivered to the whole process group.
     stop_signal: ClassVar[int] = signal.SIGINT
     # Engines that block-buffer or suppress output when stdout is not a terminal run on a PTY.
     use_pty: ClassVar[bool] = False
 
-    def __init__(self, base_work_dir: str | None = None):
+    def __init__(self, binary_path: str | None = None, base_work_dir: str | None = None):
+        self.binary = self._resolve_binary(binary_path)
         self.base_work_dir = base_work_dir
 
-    @abc.abstractmethod
+    @classmethod
+    def _resolve_binary(cls, binary_path: str | None) -> str | None:
+        if binary_path:
+            return os.path.abspath(binary_path)
+        bundled = os.path.join(REPO_ROOT, cls.bundled_binary)
+        return bundled if os.access(bundled, os.X_OK) else shutil.which(cls.binary_name)
+
     def is_available(self) -> bool:
-        """Checks if the required binary is installed and executable."""
+        """Checks if the engine binary is installed and executable."""
+        return self.binary is not None and os.access(self.binary, os.X_OK)
 
     @classmethod
     @abc.abstractmethod
@@ -241,6 +216,40 @@ class StressRunner(abc.ABC):
     @abc.abstractmethod
     def _create_parser(self, request: TestRequest, work_dir: str, listener: TestEventListener) -> OutputParser:
         """Creates the output parser for one run."""
+
+    def run_test(self, request: TestRequest, context: RunContext | None = None) -> RunResult:
+        """Executes one stress run on the requested logical CPUs and returns its classified result."""
+        if not self.is_available():
+            raise RunnerUnavailableError(f"{self.name} binary is not available")
+        context = context or RunContext()
+
+        work_dir = tempfile.mkdtemp(prefix=f"zen_tuner_{self.name}_", dir=self.base_work_dir)
+        keep_work_dir = False
+        try:
+            cmd = self._prepare(request, work_dir)
+            parser = self._create_parser(request, work_dir, context.listener)
+            telemetry = None
+            if context.smu_monitor is not None and request.core_idx is not None and context.smu_monitor.is_available():
+                telemetry = CoreTelemetryMonitor(context.smu_monitor, request.core_idx)
+            try:
+                run = self._supervise(cmd, work_dir, request, context, parser, telemetry)
+            finally:
+                parser.close()
+
+            status, message = self._classify(run, parser, context)
+            keep_work_dir = status in (RunStatus.ERROR, RunStatus.CRASH, RunStatus.UNVERIFIED)
+            return RunResult(
+                status=status,
+                completed_iterations=parser.completed_iterations,
+                elapsed_seconds=run.elapsed_seconds,
+                error_message=message,
+                telemetry=telemetry.summary if telemetry else None,
+                output=list(parser.output),
+                work_dir=work_dir if keep_work_dir else None,
+            )
+        finally:
+            if not keep_work_dir:
+                shutil.rmtree(work_dir, ignore_errors=True)
 
     def _spawn(self, cmd: list[str], work_dir: str) -> tuple[subprocess.Popen, _ProcessOutput]:
         # The child gets its own process group: terminal Ctrl+C reaches only the controller, which then stops
@@ -261,108 +270,72 @@ class StressRunner(abc.ABC):
                                 stderr=subprocess.STDOUT, process_group=0)
         return proc, _ProcessOutput(os.dup(proc.stdout.fileno()))
 
-    def run_test(self, request: TestRequest, context: RunContext | None = None) -> RunResult:
-        """Executes one stress run on the requested logical CPUs and returns its classified result."""
-        if not self.is_available():
-            raise RunnerUnavailableError(f"{self.name} binary is not available")
-        context = context or RunContext()
-        listener = context.listener
-
-        work_dir = tempfile.mkdtemp(prefix=f"zen_tuner_{self.name}_", dir=self.base_work_dir)
-        keep_work_dir = False
+    def _supervise(
+        self,
+        cmd: list[str],
+        work_dir: str,
+        request: TestRequest,
+        context: RunContext,
+        parser: OutputParser,
+        telemetry: CoreTelemetryMonitor | None,
+    ) -> _Supervision:
+        """Runs the engine until it exits; stops it once done, on error, or on cancellation."""
+        start = time.monotonic()
+        with inherited_scheduling(request.cpus):
+            proc, output = self._spawn(cmd, work_dir)
+        stop_reason: RunStatus | None = None
+        stop_deadline = 0.0
         try:
-            cmd = self._prepare(request, work_dir)
-            parser = self._create_parser(request, work_dir, listener)
-            mce_events: list[MceEvent] = []
-            telemetry: CoreTelemetryMonitor | None = None
-            if context.smu_monitor is not None and request.core_idx is not None and context.smu_monitor.is_available():
-                telemetry = CoreTelemetryMonitor(context.smu_monitor, request.core_idx)
+            while True:
+                for line in output.read_lines(POLL_INTERVAL_S):
+                    parser.handle_line(line)
+                parser.poll()
 
-            start = time.monotonic()
-            with KernelErrorMonitor(request.cpus) as kernel_mon:
-                with inherited_scheduling(request.cpus):
-                    proc, output = self._spawn(cmd, work_dir)
-                stop_reason: RunStatus | None = None
-                stop_deadline = 0.0
-                try:
-                    while True:
+                if telemetry is not None:
+                    sample = telemetry.poll()
+                    if sample is not None:
+                        context.listener.on_telemetry_sample(sample)
+
+                if proc.poll() is not None:
+                    drain_deadline = time.monotonic() + DRAIN_TIMEOUT_S
+                    while not output.eof and time.monotonic() < drain_deadline:
                         for line in output.read_lines(POLL_INTERVAL_S):
                             parser.handle_line(line)
-                        parser.poll()
+                    parser.poll()
+                    break
 
-                        for ev in kernel_mon.poll():
-                            mce_events.append(ev)
-                            listener.on_hardware_error(ev)
-
-                        if telemetry is not None:
-                            alert = telemetry.poll()
-                            if alert is not None:
-                                listener.on_stretching_detected(alert)
-
-                        if proc.poll() is not None:
-                            drain_deadline = time.monotonic() + DRAIN_TIMEOUT_S
-                            while not output.eof and time.monotonic() < drain_deadline:
-                                for line in output.read_lines(POLL_INTERVAL_S):
-                                    parser.handle_line(line)
-                            parser.poll()
-                            break
-
-                        if stop_reason is None:
-                            if context.cancel.is_set():
-                                stop_reason = RunStatus.INTERRUPTED
-                            elif parser.errors:
-                                stop_reason = RunStatus.ERROR
-                            elif parser.done:
-                                stop_reason = RunStatus.PASS
-                            if stop_reason is not None:
-                                _signal_group(proc, self.stop_signal)
-                                stop_deadline = time.monotonic() + STOP_TIMEOUT_S
-                        elif time.monotonic() > stop_deadline:
-                            _signal_group(proc, signal.SIGKILL)
-                finally:
-                    terminate_process(proc, signal.SIGKILL)
-                    # Reap helper processes the engine may have left behind in its process group.
+                if stop_reason is None:
+                    if context.cancel.is_set():
+                        stop_reason = RunStatus.INTERRUPTED
+                    elif parser.errors:
+                        stop_reason = RunStatus.ERROR
+                    elif parser.done:
+                        stop_reason = RunStatus.PASS
+                    if stop_reason is not None:
+                        _signal_group(proc, self.stop_signal)
+                        stop_deadline = time.monotonic() + STOP_TIMEOUT_S
+                elif time.monotonic() > stop_deadline:
                     _signal_group(proc, signal.SIGKILL)
-                    output.close()
-                    parser.close()
-                    if proc.stdout is not None:
-                        proc.stdout.close()
-            elapsed = time.monotonic() - start
-
-            status, message = self._classify(proc.returncode, stop_reason, parser, context)
-            keep_work_dir = status in (RunStatus.ERROR, RunStatus.CRASH)
-            return RunResult(
-                status=status,
-                tested_cpus=list(request.cpus),
-                completed_iterations=parser.completed_iterations,
-                elapsed_seconds=elapsed,
-                error_message=message,
-                errors=list(parser.errors),
-                mce_events=mce_events,
-                verified_steps=list(parser.verified_steps),
-                summary_line=parser.summary_line,
-                telemetry=telemetry.summary if telemetry else None,
-            )
         finally:
-            if not keep_work_dir:
-                shutil.rmtree(work_dir, ignore_errors=True)
+            # Kill the whole group, including helper processes the engine may have left behind, then reap.
+            _signal_group(proc, signal.SIGKILL)
+            proc.wait()
+            output.close()
+            if proc.stdout is not None:
+                proc.stdout.close()
+        return _Supervision(proc.returncode, stop_reason, time.monotonic() - start)
 
     @staticmethod
-    def _classify(
-        returncode: int | None,
-        stop_reason: RunStatus | None,
-        parser: OutputParser,
-        context: RunContext,
-    ) -> tuple[RunStatus, str | None]:
-        if stop_reason == RunStatus.INTERRUPTED or context.cancel.is_set():
+    def _classify(run: _Supervision, parser: OutputParser, context: RunContext) -> tuple[RunStatus, str | None]:
+        if run.stop_reason == RunStatus.INTERRUPTED or context.cancel.is_set():
             return RunStatus.INTERRUPTED, "Test interrupted by user"
         if parser.errors:
             return RunStatus.ERROR, parser.errors[0]
-        if stop_reason is None and returncode:
-            if returncode < 0:
-                sig = -returncode
+        if run.stop_reason is None and run.returncode:
+            if run.returncode < 0:
+                sig = -run.returncode
                 return RunStatus.CRASH, f"Process terminated by signal {sig} ({signal.strsignal(sig)})"
-            return RunStatus.CRASH, f"Process exited abnormally with code {returncode}"
+            return RunStatus.CRASH, f"Process exited abnormally with code {run.returncode}"
         if parser.done:
             return RunStatus.PASS, None
         return RunStatus.UNVERIFIED, (

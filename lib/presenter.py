@@ -8,39 +8,51 @@ from dataclasses import dataclass
 import sys
 import time
 
-from lib.models import CoreStats, MceEvent, PhysicalCore, RunResult, RunStatus, TelemetrySample
+from lib.models import (
+    STRETCH_THRESHOLD_MHZ,
+    CoreStats,
+    MceEvent,
+    PhysicalCore,
+    RunResult,
+    RunStatus,
+    TelemetrySample,
+    TelemetrySummary,
+)
 from lib.smu import RyzenSmuMonitor
 from lib.ui import RESET, Logger, get_iso_timestamp, strip_ansi
-from lib.views import ANSI_TONES, Tone, ccd_label, render_summary
+from lib.views import ANSI_TONES, Tone, ccd_label, describe_mce, render_summary
 
 
 @dataclass(frozen=True)
 class SessionInfo:
-    """Static description of the test session shown by presenters."""
+    """Static description of the test session, announced by the orchestrator."""
     profile: str = ""
     hyperthreading_mode: str = "on"
     target_iterations: int = 1
-    total_cycles: int = 1
+    total_cycles: int = 1  # 0 = until stopped
 
 
 class Presenter:
-    """Event sink for the orchestrator and runners (implements runners.base.TestEventListener)."""
+    """
+    Event sink for the orchestrator and runners (implements lib.events.TestEventListener).
+    on_hardware_error may be called from the kernel monitor thread; all other events come from the main thread.
+    """
 
     def __init__(
         self,
         all_cores: list[PhysicalCore],
-        session: SessionInfo | None = None,
         logger: Logger | None = None,
         smu_monitor: RyzenSmuMonitor | None = None,
     ):
         self.all_cores = all_cores
-        self.session = session or SessionInfo()
+        self.core_by_idx = {c.core_idx: c for c in all_cores}
         self.logger = logger
         self.smu_monitor = smu_monitor
+        self.session = SessionInfo()
         self.stats: dict[int, CoreStats] = {c.core_idx: CoreStats() for c in all_cores}
-        self.cpu_to_core = {cpu: c for c in all_cores for cpu in c.logical_cpus}
         self.cycle_num = 1
         self.current_core: PhysicalCore | None = None
+        self.current_samples: list[TelemetrySample] = []
         self.ht_label = ""
         self.core_start_time = 0.0
 
@@ -61,6 +73,12 @@ class Presenter:
         """Binds the statistics owned by the orchestrator for display."""
         self.stats = stats
 
+    @property
+    def current_stretch_mhz(self) -> float | None:
+        """Median clock drop of the run in progress, or None before the first loaded sample."""
+        summary = TelemetrySummary.from_samples(self.current_samples)
+        return summary.stretch_mhz if summary else None
+
     def _emit(self, text: str, tone: Tone = Tone.DEFAULT) -> None:
         if self.logger:
             self.logger.write(text)
@@ -76,37 +94,36 @@ class Presenter:
     def on_test_verified(self, step_name: str, completed_iterations: int) -> None:
         self._event("VERIFIED", f"Self-test {step_name} passed! (Iterations: {completed_iterations})", Tone.PASS)
 
-    def on_stretching_detected(self, sample: TelemetrySample) -> None:
-        drop_pct = sample.stretch_mhz / sample.target_mhz * 100.0 if sample.target_mhz else 0.0
-        self._event(
-            "STRETCH",
-            f"Tgt {sample.target_mhz:.0f} vs Eff {sample.effective_mhz:.0f} "
-            f"(-{sample.stretch_mhz:.0f} MHz / -{drop_pct:.1f}%)",
-            Tone.WARN,
-        )
-
-    def on_hardware_error(self, event: MceEvent) -> None:
-        if event.cpu is None:
-            where = "CPU ?"
-        else:
-            core = self.cpu_to_core.get(event.cpu)
-            where = f"CPU {event.cpu}" + (f" (Core {core.core_idx})" if core else "")
-            if event.on_tested_cpu:
-                where += " [TESTED CORE]"
-        self._event("MCE", f"!!! HARDWARE ERROR {where}: {event.message}", Tone.FAIL)
+    def on_telemetry_sample(self, sample: TelemetrySample) -> None:
+        self.current_samples.append(sample)
+        if sample.stretch_mhz >= STRETCH_THRESHOLD_MHZ:
+            drop_pct = sample.stretch_mhz / sample.target_mhz * 100.0
+            self._event(
+                "STRETCH",
+                f"Tgt {sample.target_mhz:.0f} vs Eff {sample.effective_mhz:.0f} "
+                f"(-{sample.stretch_mhz:.0f} MHz / -{drop_pct:.1f}%)",
+                Tone.WARN,
+            )
 
     # Orchestrator events
+
+    def on_session_start(self, session: SessionInfo) -> None:
+        self.session = session
+
+    def on_hardware_error(self, event: MceEvent) -> None:
+        self._event("MCE", f"!!! HARDWARE ERROR {describe_mce(event)}: {event.message}", Tone.FAIL)
 
     def on_notice(self, text: str) -> None:
         self._emit(f"[!] {text}", Tone.WARN)
 
-    def on_cycle_start(self, cycle_num: int, total_cycles: int, runner_name: str) -> None:
+    def on_cycle_start(self, cycle_num: int, runner_name: str) -> None:
         self.cycle_num = cycle_num
-        total = f" of {total_cycles}" if total_cycles > 0 else ""
+        total = f" of {self.session.total_cycles}" if self.session.total_cycles > 0 else ""
         self._emit(f"▶ Starting Cycle {cycle_num}{total} [{runner_name}]", Tone.HEADER)
 
     def on_core_start(self, cycle_num: int, core: PhysicalCore, ht_label: str) -> None:
         self.current_core = core
+        self.current_samples = []
         self.ht_label = ht_label
         self.core_start_time = time.monotonic()
         self._emit(
@@ -132,12 +149,12 @@ class Presenter:
         else:
             self._emit(f"{prefix} FAIL ({result.status}): {result.error_message}", Tone.FAIL)
 
-    def on_session_end(self, cores: list[PhysicalCore], stats: dict[int, CoreStats]) -> None:
-        """Releases the output device and prints the summary table to stdout and the log file."""
+    def on_session_end(self, cores: list[PhysicalCore], stats: dict[int, CoreStats], mce_events: list[MceEvent]) -> None:
+        """Releases the output device and prints the summary to stdout and the log file."""
         self.close()
         co_offsets = self.smu_monitor.co_offsets_by_core() if self.smu_monitor and self.smu_monitor.is_available() else {}
         colored = sys.stdout.isatty()
-        for line in [""] + render_summary(cores, stats, co_offsets) + [""]:
+        for line in [""] + render_summary(cores, stats, co_offsets, mce_events) + [""]:
             if self.logger:
                 self.logger.write(line)
             print(line if colored else strip_ansi(line))

@@ -10,14 +10,15 @@ import argparse
 from dataclasses import dataclass
 import os
 import re
-import shutil
 from typing import TextIO
 
 from lib.cpu import detect_cpu_instruction_sets, get_default_instruction_set
+from lib.events import TestEventListener
 from lib.models import TestRequest
-from runners.base import OutputParser, StressRunner, TestEventListener, parse_duration
+from runners.base import OutputParser, StressRunner, parse_duration
 
-# Torture test FFT bounds accepted by Prime95 30.x (in K); the largest supported FFT length is 32M.
+# Torture test FFT bounds in K. The upper bound assumes Prime95 30.x's largest FFT length of 32M (not verified
+# against the bundled build); Prime95 itself only tests the FFT lengths it implements within the range.
 PRIME95_MIN_FFT_K = 4
 PRIME95_MAX_FFT_K = 32768
 
@@ -40,7 +41,7 @@ FFT_PRESETS: dict[str, FFTConfig] = {
     "blend": FFTConfig(4, 8192, 4096, "Blend (4K-8192K, CPU + RAM cycling)"),
 }
 
-# Instruction-set specific deviations from FFT_PRESETS (Prime95's SSE code paths lack the smallest AVX FFT lengths).
+# Instruction-set specific deviations from FFT_PRESETS, carried over from the original preset matrix.
 FFT_PRESET_OVERRIDES: dict[tuple[str, str], FFTConfig] = {
     ("small", "sse"): FFTConfig(40, 248, 0, "Small FFTs (40K-248K in-place, L1/L2/L3, thermal stress)"),
 }
@@ -170,9 +171,6 @@ class Prime95OutputParser(OutputParser):
 
     def feed(self, line: str) -> None:
         self._check_errors(line)
-        if "Torture Test completed" in line:
-            self.summary_line = line
-
         m = PASSED_PATTERN.search(line)
         if not m:
             return
@@ -217,22 +215,8 @@ class Prime95Runner(StressRunner):
     """Prime95 (mprime) stress test runner implementation."""
 
     name = "prime95"
-
-    def __init__(self, mprime_path: str | None = None, base_work_dir: str | None = None):
-        super().__init__(base_work_dir)
-        self.mprime_bin = self._resolve_mprime_bin(mprime_path)
-
-    def is_available(self) -> bool:
-        return self.mprime_bin is not None and os.access(self.mprime_bin, os.X_OK)
-
-    @staticmethod
-    def _resolve_mprime_bin(mprime_path: str | None = None) -> str | None:
-        if mprime_path:
-            return os.path.abspath(mprime_path)
-        candidate = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "contrib/prime95/mprime")
-        if os.access(candidate, os.X_OK):
-            return candidate
-        return shutil.which("mprime")
+    bundled_binary = "contrib/prime95/mprime"
+    binary_name = "mprime"
 
     @classmethod
     def add_cli_arguments(cls, parser: argparse.ArgumentParser) -> None:
@@ -329,7 +313,7 @@ class Prime95Runner(StressRunner):
     def _prepare(self, request: TestRequest, work_dir: str) -> list[str]:
         params: Prime95Params = request.parameters
         self.write_config(work_dir, params.fft, len(request.cpus), params.test_time_min, params.mode)
-        return [self.mprime_bin, f"-w{work_dir}", "-t"]
+        return [self.binary, f"-w{work_dir}", "-t"]
 
     def _create_parser(self, request: TestRequest, work_dir: str, listener: TestEventListener) -> OutputParser:
         params: Prime95Params = request.parameters

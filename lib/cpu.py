@@ -41,10 +41,8 @@ def detect_cpu_instruction_sets(cpuinfo_path: str = "/proc/cpuinfo") -> frozense
     return frozenset(supported)
 
 
-def get_default_instruction_set(supported: frozenset[str] | set[str] | None = None) -> str:
+def get_default_instruction_set(supported: frozenset[str] | set[str]) -> str:
     """Returns the highest supported instruction set: avx512 > avx2 > avx > sse."""
-    if supported is None:
-        supported = detect_cpu_instruction_sets()
     for mode in INSTRUCTION_SET_HIERARCHY:
         if mode in supported:
             return mode
