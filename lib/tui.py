@@ -28,6 +28,7 @@ class CursesPresenter(TestEventListener):
     COLOR_ACTIVE = 4
     COLOR_HEADER = 5
     COLOR_DISABLED = 6
+    COLOR_SILVER = 7
 
     def __init__(
         self,
@@ -103,6 +104,10 @@ class CursesPresenter(TestEventListener):
                         curses.init_pair(self.COLOR_DISABLED, curses.COLOR_WHITE, bg)
                     except curses.error:
                         pass
+                try:
+                    curses.init_pair(self.COLOR_SILVER, curses.COLOR_WHITE, bg)
+                except curses.error:
+                    pass
 
             self._stdscr.keypad(True)
             self._stdscr.nodelay(True)
@@ -287,6 +292,7 @@ class CursesPresenter(TestEventListener):
         YELLOW = "\033[33m"
         MAGENTA = "\033[35m"
         CYAN = "\033[36m"
+        WHITE = "\033[37m"
         RESET = "\033[0m"
 
         def _out(text: str) -> None:
@@ -353,11 +359,19 @@ class CursesPresenter(TestEventListener):
             else:
                 status_col = f"{DIM}{'SKIPPED':<14s}{RESET}"
 
-            if core.is_preferred:
+            if core.pref_rank == 1 or (core.pref_rank is None and core.is_preferred):
+                star = f"{BOLD}{YELLOW}*{RESET}"
                 core_lbl = (
-                    f"{YELLOW}*{RESET} {core.core_idx:>2d}"
+                    f"{star} {core.core_idx:>2d}"
                     if core.core_idx < 100
-                    else f"{YELLOW}*{RESET}{core.core_idx:>3d}"
+                    else f"{star}{core.core_idx:>3d}"
+                )
+            elif core.pref_rank == 2:
+                star = f"{BOLD}{WHITE}*{RESET}"
+                core_lbl = (
+                    f"{star} {core.core_idx:>2d}"
+                    if core.core_idx < 100
+                    else f"{star}{core.core_idx:>3d}"
                 )
             else:
                 core_lbl = f"{core.core_idx:>4d}"
@@ -588,7 +602,14 @@ class CursesPresenter(TestEventListener):
 
                 c_idx = sm.core_idx
                 core_obj = core_map.get(c_idx)
-                if core_obj and core_obj.is_preferred:
+                star_color = None
+                if core_obj:
+                    if core_obj.pref_rank == 1 or (core_obj.pref_rank is None and core_obj.is_preferred):
+                        star_color = self.COLOR_WARN
+                    elif core_obj.pref_rank == 2:
+                        star_color = self.COLOR_SILVER
+
+                if star_color is not None:
                     core_str = f"* {c_idx:>2d}" if c_idx < 100 else f"*{c_idx:>3d}"
                 else:
                     core_str = f"{c_idx:>4d}"
@@ -630,6 +651,11 @@ class CursesPresenter(TestEventListener):
                 if is_active:
                     attr |= curses.A_BOLD | curses.A_REVERSE
                 self._safe_addstr(top + 2 + row_offset, left + 1, row_txt[: width - 2], attr)
+                if star_color is not None:
+                    star_attr = self._safe_color_pair(star_color) | curses.A_BOLD
+                    if is_active:
+                        star_attr |= curses.A_REVERSE
+                    self._safe_addstr(top + 2 + row_offset, left + 1, "*", star_attr)
                 row_offset += 1
         else:
             for core in self.all_cores:
@@ -652,11 +678,17 @@ class CursesPresenter(TestEventListener):
                         break
 
                 c_idx = core.core_idx
-                core_str = (
-                    (f"* {c_idx:>2d}" if c_idx < 100 else f"*{c_idx:>3d}")
-                    if core.is_preferred
-                    else f"{c_idx:>4d}"
-                )
+                star_color = None
+                if core.pref_rank == 1 or (core.pref_rank is None and core.is_preferred):
+                    star_color = self.COLOR_WARN
+                elif core.pref_rank == 2:
+                    star_color = self.COLOR_SILVER
+
+                if star_color is not None:
+                    core_str = f"* {c_idx:>2d}" if c_idx < 100 else f"*{c_idx:>3d}"
+                else:
+                    core_str = f"{c_idx:>4d}"
+
                 st = self.stats.get(c_idx, CoreStats())
                 is_active = self.current_core is not None and self.current_core.core_idx == c_idx
 
@@ -684,6 +716,11 @@ class CursesPresenter(TestEventListener):
                 if is_active:
                     attr |= curses.A_BOLD | curses.A_REVERSE
                 self._safe_addstr(top + 2 + row_offset, left + 1, row_txt[: width - 2], attr)
+                if star_color is not None:
+                    star_attr = self._safe_color_pair(star_color) | curses.A_BOLD
+                    if is_active:
+                        star_attr |= curses.A_REVERSE
+                    self._safe_addstr(top + 2 + row_offset, left + 1, "*", star_attr)
                 row_offset += 1
 
         # Vertical divider line on the right

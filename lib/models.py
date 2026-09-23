@@ -15,7 +15,8 @@ class PhysicalCore:
     ccd_id: int | None  # CCD / L3 cache group index
     logical_cpus: list[int]  # SMT thread siblings (e.g. [0, 12])
     cppc_perf: int | None = None  # ACPI CPPC highest_perf score
-    is_preferred: bool = False  # True if this core is the best core in its CCD
+    is_preferred: bool = False  # True if this core is the best core in its CCD (rank 1)
+    pref_rank: int | None = None  # CPPC ranking within CCD (1 = gold, 2 = silver)
 
 
 @dataclass

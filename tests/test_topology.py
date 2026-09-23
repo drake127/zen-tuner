@@ -87,8 +87,8 @@ class TestTopology(unittest.TestCase):
     def test_discover_topology_cppc_preferred_core(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Create cpu0 (score 216) and cpu1 (score 196) in CCD 0
-            for cpu, score in ((0, 216), (1, 196)):
+            # Create cpu0 (score 216), cpu1 (score 211), cpu2 (score 196) in CCD 0
+            for cpu, score in ((0, 216), (1, 211), (2, 196)):
                 top_p = os.path.join(tmpdir, f"cpu{cpu}", "topology")
                 os.makedirs(top_p)
                 with open(os.path.join(top_p, "core_id"), "w") as f:
@@ -100,11 +100,19 @@ class TestTopology(unittest.TestCase):
                     f.write(f"{score}\n")
 
             discovered = discover_topology(sysfs_root=tmpdir)
-            self.assertEqual(len(discovered), 2)
+            self.assertEqual(len(discovered), 3)
+            # Core 0: rank 1 (gold)
             self.assertTrue(discovered[0].is_preferred)
+            self.assertEqual(discovered[0].pref_rank, 1)
             self.assertEqual(discovered[0].cppc_perf, 216)
+            # Core 1: rank 2 (silver)
             self.assertFalse(discovered[1].is_preferred)
-            self.assertEqual(discovered[1].cppc_perf, 196)
+            self.assertEqual(discovered[1].pref_rank, 2)
+            self.assertEqual(discovered[1].cppc_perf, 211)
+            # Core 2: rank 3
+            self.assertFalse(discovered[2].is_preferred)
+            self.assertEqual(discovered[2].pref_rank, 3)
+            self.assertEqual(discovered[2].cppc_perf, 196)
 
 
 if __name__ == "__main__":

@@ -324,26 +324,44 @@ class TestTui(unittest.TestCase):
         presenter.close()
 
     def test_tui_preferred_core_asterisk(self):
+        import curses
         cores = [
-            PhysicalCore(core_idx=0, hardware_core_id=0, ccd_id=0, logical_cpus=[0, 12], is_preferred=True),
-            PhysicalCore(core_idx=1, hardware_core_id=1, ccd_id=0, logical_cpus=[1, 13], is_preferred=False),
+            PhysicalCore(0, 0, 0, [0, 12], is_preferred=True, pref_rank=1),
+            PhysicalCore(1, 1, 0, [1, 13], is_preferred=False, pref_rank=2),
+            PhysicalCore(2, 2, 0, [2, 14], is_preferred=False, pref_rank=3),
         ]
         presenter = CursesPresenter(all_cores=cores, duration_per_core=30.0)
+
+        # Mark core 0 as PASS (green) to verify green does NOT override gold star
+        presenter.stats[0].passes = 1
 
         calls = []
 
         def fake_safe_addstr(y, x, text, attr=0):
-            calls.append(text)
+            calls.append((text, attr))
 
         presenter._safe_addstr = fake_safe_addstr
         presenter._stdscr = MagicMock()
         presenter._curses_active = True
+        presenter._safe_color_pair = lambda pair: pair * 10
 
         # Non-SMU path
         presenter._draw_cores_pane(top=0, left=0, height=20, width=50)
-        rendered_text = "\n".join(calls)
-        self.assertIn("*  0", rendered_text)
-        self.assertIn("   1", rendered_text)
+        rendered_texts = [c[0] for c in calls]
+        rendered_str = "\n".join(rendered_texts)
+        self.assertIn("*  0", rendered_str)
+        self.assertIn("*  1", rendered_str)
+        self.assertIn("   2", rendered_str)
+
+        # Verify separate star calls were made with gold and silver attributes
+        star_calls = [c for c in calls if c[0] == "*"]
+        self.assertEqual(len(star_calls), 2)
+        # Gold star for core 0
+        gold_attr = presenter._safe_color_pair(presenter.COLOR_WARN) | curses.A_BOLD
+        self.assertEqual(star_calls[0][1], gold_attr)
+        # Silver star for core 1
+        silver_attr = presenter._safe_color_pair(presenter.COLOR_SILVER) | curses.A_BOLD
+        self.assertEqual(star_calls[1][1], silver_attr)
 
         # Summary table path
         from lib.ui import strip_ansi
@@ -351,9 +369,15 @@ class TestTui(unittest.TestCase):
         presenter.logger = MagicMock()
         presenter.logger.log = lambda t: logged.append(t)
         presenter.print_summary_table(cores, presenter.stats)
-        table_output = strip_ansi("\n".join(logged))
+        raw_output = "\n".join(logged)
+        # Check raw ANSI for gold (\033[33m) and silver (\033[37m)
+        self.assertIn("\033[33m*\033[0m", raw_output)
+        self.assertIn("\033[37m*\033[0m", raw_output)
+
+        table_output = strip_ansi(raw_output)
         self.assertIn("*  0", table_output)
-        self.assertIn("   1", table_output)
+        self.assertIn("*  1", table_output)
+        self.assertIn("   2", table_output)
 
         presenter.close()
 

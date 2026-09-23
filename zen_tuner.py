@@ -62,7 +62,7 @@ def main() -> None:
         type=str,
         default="on",
         choices=["off", "on", "cycle", "rr"],
-        help="Hyperthreading mode: 'off' (1T), 'on' (2T SMT), 'cycle' (alternate T0 -> T1 -> T0+T1 across cycles) (default: 'on')",
+        help="Hyperthreading mode: 'off' (1T), 'on' (2T SMT), 'cycle' (alternate T0->T1->T0+T1) (default: 'on')",
     )
     parser.add_argument(
         "--stop-on-error",

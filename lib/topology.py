@@ -92,13 +92,23 @@ def discover_topology(sysfs_root: str = "/sys/devices/system/cpu") -> list[Physi
             )
         )
 
-    # Determine preferred (best) core(s) per CCD based on CPPC performance ranking
-    ccd_perfs: dict[int | None, int] = {}
+    # Determine preferred ranking per CCD based on CPPC performance ranking
+    ccd_cores: dict[int | None, list[PhysicalCore]] = {}
     for c in cores:
-        if c.cppc_perf is not None and c.cppc_perf > 0:
-            ccd_perfs[c.ccd_id] = max(ccd_perfs.get(c.ccd_id, 0), c.cppc_perf)
+        ccd_cores.setdefault(c.ccd_id, []).append(c)
 
-    if ccd_perfs:
+    core_ranks: dict[int, int] = {}
+    for ccd_id, group in ccd_cores.items():
+        unique_perfs = sorted(
+            {c.cppc_perf for c in group if c.cppc_perf is not None and c.cppc_perf > 0},
+            reverse=True,
+        )
+        perf_to_rank = {p: r + 1 for r, p in enumerate(unique_perfs)}
+        for c in group:
+            if c.cppc_perf in perf_to_rank:
+                core_ranks[c.core_idx] = perf_to_rank[c.cppc_perf]
+
+    if core_ranks:
         cores = [
             PhysicalCore(
                 core_idx=c.core_idx,
@@ -106,7 +116,8 @@ def discover_topology(sysfs_root: str = "/sys/devices/system/cpu") -> list[Physi
                 ccd_id=c.ccd_id,
                 logical_cpus=c.logical_cpus,
                 cppc_perf=c.cppc_perf,
-                is_preferred=(c.cppc_perf is not None and c.cppc_perf == ccd_perfs.get(c.ccd_id)),
+                pref_rank=core_ranks.get(c.core_idx),
+                is_preferred=(core_ranks.get(c.core_idx) == 1),
             )
             for c in cores
         ]
