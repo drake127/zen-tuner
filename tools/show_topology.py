@@ -9,15 +9,16 @@ import sys
 # Ensure repository root is on sys.path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from lib.topology import discover_topology
-
-BOLD = "\033[1m"
-CYAN = "\033[36m"
-RESET = "\033[0m"
+from lib.topology import TopologyError, discover_topology
+from lib.ui import BOLD, CYAN, RESET
 
 
 def main() -> None:
-    cores = discover_topology()
+    try:
+        cores = discover_topology()
+    except TopologyError as e:
+        print(f"[ERROR] {e}", file=sys.stderr)
+        sys.exit(1)
     if not cores:
         print("Failed to discover CPU topology from /sys/devices/system/cpu!", file=sys.stderr)
         sys.exit(1)

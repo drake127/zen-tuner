@@ -3,26 +3,31 @@ CPU topology discovery and core selection parsing.
 Discovers physical cores, hardware core IDs, CCDs, and logical CPU siblings from sysfs.
 """
 
+import dataclasses
 import glob
 import os
-from typing import Any
 
 from lib.models import PhysicalCore
 
 
+class TopologyError(Exception):
+    """Raised when the CPU topology cannot be used by Zen Tuner."""
+
+
+def _read_int(path: str) -> int | None:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
 def _read_cppc_perf(cpu_id: int, sysfs_root: str) -> int | None:
     """Reads CPPC highest_perf or amd-pstate prefcore ranking from sysfs for cpu_id."""
-    paths = (
-        os.path.join(sysfs_root, f"cpu{cpu_id}", "acpi_cppc", "highest_perf"),
-        os.path.join(sysfs_root, f"cpu{cpu_id}", "cpufreq", "amd_pstate_prefcore_ranking"),
-    )
-    for p in paths:
-        if os.path.exists(p):
-            try:
-                with open(p, "r", encoding="utf-8") as f:
-                    return int(f.read().strip())
-            except (OSError, ValueError):
-                pass
+    for rel_path in ("acpi_cppc/highest_perf", "cpufreq/amd_pstate_prefcore_ranking"):
+        perf = _read_int(os.path.join(sysfs_root, f"cpu{cpu_id}", rel_path))
+        if perf is not None:
+            return perf
     return None
 
 
@@ -30,137 +35,85 @@ def discover_topology(sysfs_root: str = "/sys/devices/system/cpu") -> list[Physi
     """
     Scans sysfs to discover physical CPU cores, SMT siblings, CCD / L3 cache topology,
     and CPPC preferred core ranking.
-    Returns cores sorted by CCD ID and hardware core ID.
+    Returns cores sorted by CCD ID and hardware core ID. Raises TopologyError on multi-socket systems.
     """
-    raw_cores: dict[int, dict[str, Any]] = {}
+    raw_cores: dict[int, tuple[int | None, list[int]]] = {}
     package_ids: set[int] = set()
-    pattern = os.path.join(sysfs_root, "cpu[0-9]*")
 
-    for cpu_path in sorted(glob.glob(pattern)):
-        base = os.path.basename(cpu_path)
+    for cpu_path in glob.glob(os.path.join(sysfs_root, "cpu[0-9]*")):
         try:
-            cpu_id = int(base.replace("cpu", ""))
+            cpu_id = int(os.path.basename(cpu_path).removeprefix("cpu"))
         except ValueError:
             continue
 
-        pkg_file = os.path.join(cpu_path, "topology/physical_package_id")
-        if os.path.exists(pkg_file):
-            try:
-                with open(pkg_file, "r", encoding="utf-8") as f:
-                    package_ids.add(int(f.read().strip()))
-            except (OSError, ValueError):
-                pass
+        package_id = _read_int(os.path.join(cpu_path, "topology/physical_package_id"))
+        if package_id is not None:
+            package_ids.add(package_id)
 
-        core_id_file = os.path.join(cpu_path, "topology/core_id")
-        if not os.path.exists(core_id_file):
+        hw_core_id = _read_int(os.path.join(cpu_path, "topology/core_id"))
+        if hw_core_id is None:
             continue
 
-        try:
-            with open(core_id_file, "r", encoding="utf-8") as f:
-                hw_core_id = int(f.read().strip())
-        except (OSError, ValueError):
-            continue
+        ccd_id = _read_int(os.path.join(cpu_path, "cache/index3/id"))
+        raw_cores.setdefault(hw_core_id, (ccd_id, []))[1].append(cpu_id)
 
-        l3_file = os.path.join(cpu_path, "cache/index3/id")
-        ccd_id: int | None = None
-        if os.path.exists(l3_file):
-            try:
-                with open(l3_file, "r", encoding="utf-8") as f:
-                    ccd_id = int(f.read().strip())
-            except (OSError, ValueError):
-                pass
+    if len(package_ids) > 1:
+        raise TopologyError(f"Multi-socket systems are not supported (detected sockets: {sorted(package_ids)})")
 
-        if hw_core_id not in raw_cores:
-            raw_cores[hw_core_id] = {"cpus": [], "ccd": ccd_id}
-        raw_cores[hw_core_id]["cpus"].append(cpu_id)
-
-    assert len(package_ids) <= 1, f"Multi-socket systems are not supported (detected sockets: {package_ids})"
-
-    # Sort cores by CCD ID then by hardware core ID
-    sorted_hw_ids = sorted(raw_cores.keys(), key=lambda hid: (raw_cores[hid]["ccd"] or 0, hid))
+    sorted_hw_ids = sorted(raw_cores, key=lambda hid: (raw_cores[hid][0] or 0, hid))
     cores: list[PhysicalCore] = []
     for idx, hid in enumerate(sorted_hw_ids):
-        cpus = sorted(raw_cores[hid]["cpus"])
-        perf = _read_cppc_perf(cpus[0], sysfs_root) if cpus else None
+        ccd_id, cpus = raw_cores[hid]
+        cpus.sort()
         cores.append(
             PhysicalCore(
                 core_idx=idx,
                 hardware_core_id=hid,
-                ccd_id=raw_cores[hid]["ccd"],
+                ccd_id=ccd_id,
                 logical_cpus=cpus,
-                cppc_perf=perf,
+                cppc_perf=_read_cppc_perf(cpus[0], sysfs_root),
             )
         )
 
-    # Determine preferred ranking per CCD based on CPPC performance ranking
-    ccd_cores: dict[int | None, list[PhysicalCore]] = {}
+    # Rank cores within each CCD by CPPC performance score (1 = best)
+    ccd_perfs: dict[int | None, set[int]] = {}
     for c in cores:
-        ccd_cores.setdefault(c.ccd_id, []).append(c)
+        if c.cppc_perf is not None and c.cppc_perf > 0:
+            ccd_perfs.setdefault(c.ccd_id, set()).add(c.cppc_perf)
+    ranks = {ccd: {p: r + 1 for r, p in enumerate(sorted(perfs, reverse=True))} for ccd, perfs in ccd_perfs.items()}
 
-    core_ranks: dict[int, int] = {}
-    for ccd_id, group in ccd_cores.items():
-        unique_perfs = sorted(
-            {c.cppc_perf for c in group if c.cppc_perf is not None and c.cppc_perf > 0},
-            reverse=True,
-        )
-        perf_to_rank = {p: r + 1 for r, p in enumerate(unique_perfs)}
-        for c in group:
-            if c.cppc_perf in perf_to_rank:
-                core_ranks[c.core_idx] = perf_to_rank[c.cppc_perf]
-
-    if core_ranks:
-        cores = [
-            PhysicalCore(
-                core_idx=c.core_idx,
-                hardware_core_id=c.hardware_core_id,
-                ccd_id=c.ccd_id,
-                logical_cpus=c.logical_cpus,
-                cppc_perf=c.cppc_perf,
-                pref_rank=core_ranks.get(c.core_idx),
-                is_preferred=(core_ranks.get(c.core_idx) == 1),
-            )
-            for c in cores
-        ]
-
-    return cores
+    return [dataclasses.replace(c, pref_rank=ranks.get(c.ccd_id, {}).get(c.cppc_perf)) for c in cores]
 
 
 def parse_core_selection(selection_str: str, available_cores: list[PhysicalCore]) -> list[PhysicalCore]:
     """
     Parses core selection strings like 'all', '0-5', '0,2,4' into a list of PhysicalCore objects.
-    Raises ValueError on invalid formats or empty selections.
+    Raises ValueError on invalid formats, unknown core indices, or empty selections.
     """
     selection_str = selection_str.strip().lower()
     if selection_str in ("all", "*"):
         return list(available_cores)
 
-    selected_indices: set[int] = set()
     parts = [p.strip() for p in selection_str.split(",") if p.strip()]
     if not parts:
         raise ValueError(f"Empty core selection string: '{selection_str}'")
 
+    selected_indices: set[int] = set()
     for part in parts:
-        if "-" in part:
-            split_parts = part.split("-", 1)
-            try:
-                start, end = int(split_parts[0]), int(split_parts[1])
-                if start > end:
-                    raise ValueError(f"Invalid range bounds: '{part}'")
-                selected_indices.update(range(start, end + 1))
-            except ValueError as exc:
-                raise ValueError(f"Invalid core range: '{part}'") from exc
-        else:
-            try:
-                selected_indices.add(int(part))
-            except ValueError as exc:
-                raise ValueError(f"Invalid core index: '{part}'") from exc
+        start_str, sep, end_str = part.partition("-")
+        try:
+            start = int(start_str)
+            end = int(end_str) if sep else start
+        except ValueError as exc:
+            raise ValueError(f"Invalid core selection: '{part}'") from exc
+        if start > end:
+            raise ValueError(f"Invalid core range bounds: '{part}'")
+        selected_indices.update(range(start, end + 1))
 
     core_map = {c.core_idx: c for c in available_cores}
-    selected_cores = [core_map[i] for i in sorted(selected_indices) if i in core_map]
-
-    if not selected_cores:
+    unknown = sorted(selected_indices - core_map.keys())
+    if unknown:
         available_range = f"0-{len(available_cores) - 1}" if available_cores else "none"
-        raise ValueError(f"No valid cores matching '{selection_str}'. Available: {available_range}")
+        raise ValueError(f"Unknown core indices {unknown} in '{selection_str}'. Available: {available_range}")
 
-    return selected_cores
-
+    return [core_map[i] for i in sorted(selected_indices)]

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Diagnostic utility: Live monitor for AMD Ryzen APERF/MPERF clock stretching on specified CPUs.
+Diagnostic utility: Live monitor of SMU-reported clock stretching of a physical core (requires ryzen_smu).
 """
 
 import argparse
@@ -11,44 +11,52 @@ import time
 # Ensure repository root is on sys.path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from lib.monitors import CycleStretchingMonitor
-
-BOLD = "\033[1m"
-YELLOW = "\033[33m"
-GREEN = "\033[32m"
-RESET = "\033[0m"
+from lib.models import STRETCH_THRESHOLD_MHZ
+from lib.monitors import CoreTelemetryMonitor
+from lib.smu import RyzenSmuMonitor
+from lib.topology import discover_topology
+from lib.ui import RESET, YELLOW
+from lib.views import fmt_drop
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Live monitor for AMD Ryzen APERF/MPERF clock stretching.")
-    parser.add_argument("--cpus", type=str, default="0", help="Comma-separated CPU IDs to monitor (e.g. '0,12')")
-    parser.add_argument("--interval", type=float, default=1.0, help="Polling interval in seconds (default: 1.0)")
+    parser = argparse.ArgumentParser(description="Live monitor of SMU-reported clock stretching of a physical core.")
+    parser.add_argument("--core", type=int, default=0, help="Physical core index to monitor (default: 0)")
+    parser.add_argument("--interval", type=float, default=1.0, help="Sampling interval in seconds (default: 1.0)")
     parser.add_argument("--duration", type=float, default=10.0, help="Total monitoring duration in seconds (default: 10)")
-    parser.add_argument("--threshold", type=float, default=50.0, help="Stretch alert threshold in MHz (default: 50.0)")
-
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=STRETCH_THRESHOLD_MHZ,
+        help=f"Stretch alert threshold in MHz (default: {STRETCH_THRESHOLD_MHZ})",
+    )
     args = parser.parse_args()
-    cpus = [int(c.strip()) for c in args.cpus.split(",") if c.strip()]
 
-    print(f"Monitoring CPUs {cpus} for {args.duration:.1f}s (Interval: {args.interval}s, Threshold: {args.threshold} MHz)...")
-    start = time.time()
+    with RyzenSmuMonitor(core_count=len(discover_topology()) or None) as smu:
+        if not smu.is_available():
+            print("[ERROR] ryzen_smu telemetry is not available; clock stretching cannot be measured.", file=sys.stderr)
+            sys.exit(1)
 
-    with CycleStretchingMonitor(cpus=cpus, threshold_mhz=args.threshold, sample_interval=args.interval) as mon:
-        while time.time() - start < args.duration:
-            samples = mon.poll()
-            if samples:
-                for s in samples:
-                    print(
-                        f"[{YELLOW}ALERT{RESET}] CPU {s.cpu}: Target {s.target_mhz:.0f} MHz vs "
-                        f"Effective {s.effective_mhz:.0f} MHz (Drop: -{s.stretch_mhz:.0f} MHz / -{s.stretch_pct:.1f}%)"
-                    )
-            time.sleep(args.interval / 2.0)
+        print(f"Monitoring Core {args.core} for {args.duration:.1f}s (interval {args.interval}s, "
+              f"threshold {args.threshold} MHz). Samples are taken only under full load (C0 >= 95%).")
+        mon = CoreTelemetryMonitor(smu, args.core, threshold_mhz=args.threshold, sample_interval=args.interval)
+        start = time.monotonic()
+        while time.monotonic() - start < args.duration:
+            alert = mon.poll()
+            if alert:
+                print(
+                    f"[{YELLOW}ALERT{RESET}] Core {args.core}: Target {alert.target_mhz:.0f} MHz vs "
+                    f"Effective {alert.effective_mhz:.0f} MHz (Drop: -{alert.stretch_mhz:.0f} MHz)"
+                )
+            time.sleep(args.interval / 4.0)
 
+    summary = mon.summary
     print("\nSummary:")
-    print(f"Total samples recorded: {len(mon.all_samples)}")
-    print(f"Max stretch recorded: {mon.max_stretch_mhz:.1f} MHz")
-    print(f"Alerts exceeding {args.threshold} MHz: {mon.stretch_alerts_count}")
+    print(f"Samples under load: {len(mon.samples)}")
+    if summary:
+        print(f"Median drop: {fmt_drop(summary.stretch_mhz)} | Max drop: {summary.max_stretch_mhz:.0f} MHz | "
+              f"Stretching detected: {summary.stretching_detected}")
 
 
 if __name__ == "__main__":
     main()
-

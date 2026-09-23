@@ -4,7 +4,15 @@ Pure data classes with zero dependencies on terminal formatting or logging.
 """
 
 from dataclasses import dataclass, field
+from enum import StrEnum
+import statistics
 from typing import Any
+
+# Clock drops at or below this value are measurement noise between the SMU clock and effective clock readings.
+STRETCH_NOISE_MHZ: float = 5.0
+
+# Median clock drop at or above this value is reported as clock stretching.
+STRETCH_THRESHOLD_MHZ: float = 50.0
 
 
 @dataclass(frozen=True)
@@ -15,8 +23,90 @@ class PhysicalCore:
     ccd_id: int | None  # CCD / L3 cache group index
     logical_cpus: list[int]  # SMT thread siblings (e.g. [0, 12])
     cppc_perf: int | None = None  # ACPI CPPC highest_perf score
-    is_preferred: bool = False  # True if this core is the best core in its CCD (rank 1)
     pref_rank: int | None = None  # CPPC ranking within CCD (1 = gold, 2 = silver)
+
+
+class RunStatus(StrEnum):
+    """Outcome of a single core stress test execution."""
+    PASS = "PASS"
+    ERROR = "ERROR"  # stress engine reported a computation error
+    CRASH = "CRASH"  # stress process terminated abnormally
+    UNVERIFIED = "UNVERIFIED"  # process ended before completing the requested iterations
+    INTERRUPTED = "INTERRUPTED"  # cancelled by the user
+
+
+@dataclass(frozen=True)
+class MceEvent:
+    """Hardware Machine Check Exception or Hardware Error line captured from kernel logs."""
+    cpu: int | None
+    message: str
+    on_tested_cpu: bool | None  # None when the kernel line does not identify the CPU
+
+
+@dataclass(frozen=True)
+class TelemetrySample:
+    """Per-core SMU telemetry sampled while the core is fully loaded."""
+    target_mhz: float
+    effective_mhz: float
+    voltage_v: float
+    power_w: float
+    temp_c: float
+
+    @property
+    def stretch_mhz(self) -> float:
+        drop = self.target_mhz - self.effective_mhz
+        return drop if drop > STRETCH_NOISE_MHZ else 0.0
+
+
+@dataclass(frozen=True)
+class TelemetrySummary:
+    """Median telemetry of a single test run; medians suppress transient spikes (e.g. FFT size switches)."""
+    samples: int
+    target_mhz: float
+    effective_mhz: float
+    stretch_mhz: float
+    max_stretch_mhz: float
+    voltage_v: float
+    power_w: float
+    temp_c: float
+
+    @property
+    def stretching_detected(self) -> bool:
+        return self.stretch_mhz >= STRETCH_THRESHOLD_MHZ
+
+    @classmethod
+    def from_samples(cls, samples: list[TelemetrySample]) -> "TelemetrySummary | None":
+        if not samples:
+            return None
+        return cls(
+            samples=len(samples),
+            target_mhz=statistics.median(s.target_mhz for s in samples),
+            effective_mhz=statistics.median(s.effective_mhz for s in samples),
+            stretch_mhz=statistics.median(s.stretch_mhz for s in samples),
+            max_stretch_mhz=max(s.stretch_mhz for s in samples),
+            voltage_v=statistics.median(s.voltage_v for s in samples),
+            power_w=statistics.median(s.power_w for s in samples),
+            temp_c=statistics.median(s.temp_c for s in samples),
+        )
+
+
+@dataclass
+class RunResult:
+    """Outcome and telemetry for a single core stress test execution."""
+    status: RunStatus
+    tested_cpus: list[int]
+    completed_iterations: int
+    elapsed_seconds: float
+    error_message: str | None = None
+    errors: list[str] = field(default_factory=list)
+    mce_events: list[MceEvent] = field(default_factory=list)
+    verified_steps: list[str] = field(default_factory=list)
+    summary_line: str | None = None
+    telemetry: TelemetrySummary | None = None
+
+    @property
+    def passed(self) -> bool:
+        return self.status == RunStatus.PASS
 
 
 @dataclass
@@ -24,61 +114,25 @@ class CoreStats:
     """Aggregated test execution statistics for a physical core across cycle runs."""
     passes: int = 0
     failures: int = 0
-    verified_tests: int = 0
+    verified_iterations: int = 0
     total_duration: float = 0.0
-    active_errors: list[str] = field(default_factory=list)
-    idle_mce_errors: list[str] = field(default_factory=list)
-    avg_target_mhz: float | None = None
-    avg_effective_mhz: float | None = None
-    max_stretch_mhz: float = 0.0
-    avg_stretch_mhz: float = 0.0
-    median_stretch_mhz: float = 0.0
-    stretching_detected: bool = False
-    co_offset: int | None = None
-    # SMU snapshot metrics captured at end of each test (for results table)
-    avg_voltage_v: float | None = None
-    avg_power_w: float | None = None
-    avg_temp_c: float | None = None
+    errors: list[str] = field(default_factory=list)
+    mce_events: list[MceEvent] = field(default_factory=list)
+    runs_telemetry: list[TelemetrySummary] = field(default_factory=list)
 
+    @property
+    def telemetry(self) -> TelemetrySummary | None:
+        """Telemetry of the run with the worst median clock stretch (latest run wins ties)."""
+        worst: TelemetrySummary | None = None
+        for summary in self.runs_telemetry:
+            if worst is None or summary.stretch_mhz >= worst.stretch_mhz:
+                worst = summary
+        return worst
 
-@dataclass(frozen=True)
-class MceEvent:
-    """Hardware Machine Check Exception or Hardware Error captured from kernel logs."""
-    cpu: int | None
-    message: str
-    is_active_core: bool
-
-
-@dataclass(frozen=True)
-class StretchSample:
-    """Instantaneous telemetry sample of clock stretching measured via APERF/MPERF MSRs."""
-    cpu: int
-    target_mhz: float
-    effective_mhz: float
-    stretch_mhz: float
-    stretch_pct: float
-
-
-@dataclass
-class RunResult:
-    """Outcome and telemetry metrics for a single core stress test execution."""
-    passed: bool
-    status: str  # PASS, ACTIVE_ERROR, IDLE_MCE_ERROR, PROCESS_CRASH, TIMEOUT, UNVERIFIED
-    tested_cpus: list[int]
-    completed_tests: int
-    elapsed_seconds: float
-    error_message: str | None = None
-    active_errors: list[str] = field(default_factory=list)
-    idle_mce_errors: list[MceEvent] = field(default_factory=list)
-    verified_ffts: list[str] = field(default_factory=list)
-    summary_line: str | None = None
-    stretching_detected: bool = False
-    max_stretch_mhz: float = 0.0
-    avg_stretch_mhz: float = 0.0
-    median_stretch_mhz: float = 0.0
-    avg_target_mhz: float | None = None
-    avg_effective_mhz: float | None = None
-    stretch_samples_count: int = 0
+    @property
+    def stretching_detected(self) -> bool:
+        summary = self.telemetry
+        return summary is not None and summary.stretching_detected
 
 
 @dataclass
@@ -86,10 +140,9 @@ class TestRequest:
     """Generic request specifying stress test execution parameters on target CPUs."""
     __test__ = False
     cpus: list[int]
-    duration_seconds: float | None = None
-    target_iterations: int | None = None
-    graceful: bool = True
-    parameters: dict[str, Any] = field(default_factory=dict)
+    target_iterations: int = 1
+    core_idx: int | None = None
+    parameters: Any = None  # runner-specific parameters object produced by StressRunner.parse_parameters
 
 
 @dataclass(frozen=True)
@@ -134,5 +187,3 @@ class SmuSnapshot:
     package: PackageSmuMetrics
     pm_version: int
     slots: list[CoreSmuMetrics] = field(default_factory=list)
-
-

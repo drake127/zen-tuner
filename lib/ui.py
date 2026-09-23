@@ -1,10 +1,11 @@
 """
-Terminal utilities for Zen Tuner: Logger, ANSI colour constants, and helper functions.
+Terminal utilities for Zen Tuner: session log file, ANSI colour constants, and helper functions.
 """
 
 import datetime
 import os
 import re
+import threading
 
 # ANSI Color codes
 BOLD = "\033[1m"
@@ -32,12 +33,13 @@ def get_iso_timestamp() -> str:
 
 
 class Logger:
-    """Writes log messages to console and persists an uncolored plain-text copy to a log file."""
+    """Persists an uncolored plain-text copy of session messages to a log file."""
 
     def __init__(self, log_path: str):
         self.log_path = log_path
         os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
         self.file = open(log_path, "a", encoding="utf-8")
+        self._lock = threading.Lock()
 
     def __enter__(self) -> "Logger":
         return self
@@ -45,13 +47,13 @@ class Logger:
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.close()
 
-    def log(self, text: str, to_console: bool = True) -> None:
-        if to_console:
-            print(text)
-        clean_text = strip_ansi(text)
-        self.file.write(clean_text + "\n")
-        self.file.flush()
+    def write(self, text: str) -> None:
+        with self._lock:
+            if not self.file.closed:
+                self.file.write(strip_ansi(text) + "\n")
+                self.file.flush()
 
     def close(self) -> None:
-        if not self.file.closed:
-            self.file.close()
+        with self._lock:
+            if not self.file.closed:
+                self.file.close()

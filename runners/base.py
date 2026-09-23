@@ -1,15 +1,36 @@
 """
-Abstract base class and event listener protocols for pluggable stress test runners.
-Decouples stress engines (Prime95, stress-ng, etc.) from presentation and orchestration.
+Abstract base class, output parser and event listener protocols for pluggable stress test runners.
+Decouples stress engines (Prime95, y-cruncher, ...) from presentation and orchestration; the common process
+supervision loop (spawn, output parsing, telemetry, kernel error monitoring, stop and exit classification) lives here.
 """
 
 import abc
 import argparse
+import codecs
+from dataclasses import dataclass, field
+import os
+import pty
+import re
+import select
+import shutil
 import signal
 import subprocess
-from typing import Any, Protocol
+import tempfile
+import threading
+import time
+from typing import Any, ClassVar, Protocol
 
-from lib.models import MceEvent, RunResult, StretchSample, TestRequest
+from lib.models import MceEvent, RunResult, RunStatus, TelemetrySample, TestRequest
+from lib.monitors import CoreTelemetryMonitor, KernelErrorMonitor
+from lib.sched import inherited_scheduling
+from lib.smu import RyzenSmuMonitor
+from lib.ui import strip_ansi
+
+POLL_INTERVAL_S = 0.1
+STOP_TIMEOUT_S = 5.0
+DRAIN_TIMEOUT_S = 1.0
+
+LINE_SPLIT_PATTERN = re.compile(r"[\r\n]+")
 
 
 class TestEventListener(Protocol):
@@ -17,107 +38,341 @@ class TestEventListener(Protocol):
     __test__ = False
 
     def on_output_line(self, line: str) -> None:
-        """Called when a raw or sanitized stdout line is received from the runner."""
+        """Called for every non-empty sanitized output line of the stress process."""
         ...
 
-    def on_test_verified(self, iteration_name: str, completed_count: int) -> None:
-        """Called when a self-test or iteration is mathematically validated."""
+    def on_test_verified(self, step_name: str, completed_iterations: int) -> None:
+        """Called when a self-test step is validated by the stress engine."""
         ...
 
-    def on_stretching_detected(self, sample: StretchSample) -> None:
-        """Called when hardware clock stretching exceeds the configured threshold."""
+    def on_stretching_detected(self, sample: TelemetrySample) -> None:
+        """Called when a telemetry sample shows a clock drop above the stretching threshold."""
         ...
 
     def on_hardware_error(self, event: MceEvent) -> None:
-        """Called when an active hardware error or idle MCE is detected."""
+        """Called when the kernel reports a hardware error / MCE during the run."""
         ...
 
-    def on_grace_period_started(self, max_duration_s: float) -> None:
-        """Called when the time target is reached and graceful completion begins."""
-        ...
+
+class NullListener:
+    """Listener ignoring all events."""
+
+    def on_output_line(self, line: str) -> None:
+        pass
+
+    def on_test_verified(self, step_name: str, completed_iterations: int) -> None:
+        pass
+
+    def on_stretching_detected(self, sample: TelemetrySample) -> None:
+        pass
+
+    def on_hardware_error(self, event: MceEvent) -> None:
+        pass
+
+
+@dataclass
+class RunContext:
+    """Environment of a single test run: event sink, cancellation token and optional SMU telemetry source."""
+    listener: TestEventListener = field(default_factory=NullListener)
+    cancel: threading.Event = field(default_factory=threading.Event)
+    smu_monitor: RyzenSmuMonitor | None = None
+
+
+class RunnerUnavailableError(RuntimeError):
+    """Raised when a stress engine binary is missing or not executable."""
+
+
+class OutputParser(abc.ABC):
+    """Interprets the output of a single stress process run and tracks verified iterations and errors."""
+
+    def __init__(self, target_iterations: int, listener: TestEventListener):
+        self.target_iterations = target_iterations
+        self.listener = listener
+        self.completed_iterations = 0
+        self.verified_steps: list[str] = []
+        self.errors: list[str] = []
+        self.summary_line: str | None = None
+
+    @property
+    def done(self) -> bool:
+        return self.completed_iterations >= self.target_iterations
+
+    def clean_line(self, line: str) -> str:
+        """Normalizes a raw output line for display and parsing."""
+        return strip_ansi(line).strip()
+
+    def handle_line(self, raw_line: str) -> None:
+        line = self.clean_line(raw_line)
+        if line:
+            self.listener.on_output_line(line)
+            self.feed(line)
+
+    @abc.abstractmethod
+    def feed(self, line: str) -> None:
+        """Parses one cleaned output line."""
+
+    def poll(self) -> None:
+        """Hook for reading side channels (e.g. result files); called on every supervision tick and after exit."""
+
+    def close(self) -> None:
+        """Releases resources held by the parser."""
+
+    def add_error(self, message: str) -> None:
+        if message not in self.errors:
+            self.errors.append(message)
+
+    def step_verified(self, step_name: str, completes_iteration: bool) -> None:
+        self.verified_steps.append(step_name)
+        if completes_iteration:
+            self.completed_iterations += 1
+        self.listener.on_test_verified(step_name, self.completed_iterations)
+
+
+class _ProcessOutput:
+    """Non-blocking line reader over a pipe or PTY master file descriptor."""
+
+    def __init__(self, fd: int):
+        self.fd = fd
+        self.eof = False
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self._pending = ""
+        os.set_blocking(fd, False)
+
+    def read_lines(self, timeout: float) -> list[str]:
+        if self.eof:
+            return []
+        ready, _, _ = select.select([self.fd], [], [], timeout)
+        if not ready:
+            return []
+        while True:
+            try:
+                chunk = os.read(self.fd, 65536)
+            except BlockingIOError:
+                break
+            except OSError:
+                # A PTY master reports EIO once the slave side is closed by the exited child.
+                chunk = b""
+            if not chunk:
+                self.eof = True
+                break
+            self._pending += self._decoder.decode(chunk)
+        parts = LINE_SPLIT_PATTERN.split(self._pending)
+        self._pending = parts.pop()
+        if self.eof:
+            parts.append(self._pending + self._decoder.decode(b"", final=True))
+            self._pending = ""
+        return parts
+
+    def close(self) -> None:
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+
+
+def _signal_group(proc: subprocess.Popen, sig: int) -> None:
+    try:
+        os.killpg(proc.pid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def terminate_process(proc: subprocess.Popen, sig: int = signal.SIGTERM, timeout_s: float = STOP_TIMEOUT_S) -> None:
+    """Sends sig to the child's process group and waits; falls back to SIGKILL after timeout_s."""
+    if proc.poll() is not None:
+        return
+    _signal_group(proc, sig)
+    try:
+        proc.wait(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        _signal_group(proc, signal.SIGKILL)
+        proc.wait()
+
+
+def parse_duration(value: str) -> float:
+    """Parses durations like '300', '300s', '5m', '1h' into seconds; a bare number means seconds."""
+    text = str(value).strip().lower()
+    multipliers = {"s": 1.0, "m": 60.0, "h": 3600.0}
+    unit = text[-1:] if text[-1:] in multipliers else "s"
+    number = text[:-1] if text[-1:] in multipliers else text
+    try:
+        seconds = float(number) * multipliers[unit]
+    except ValueError as exc:
+        raise ValueError(f"Invalid duration: '{value}' (expected e.g. '90', '90s', '2m', '1h')") from exc
+    if seconds <= 0:
+        raise ValueError(f"Duration must be positive: '{value}'")
+    return seconds
 
 
 class StressRunner(abc.ABC):
-    """Abstract base class for stress test execution engines."""
+    """
+    Base class for stress test execution engines.
+    Subclasses describe how to configure and launch the engine (_prepare) and how to interpret its output
+    (_create_parser); run_test supervises the process uniformly for all engines.
+    """
 
-    @property
-    @abc.abstractmethod
-    def name(self) -> str:
-        """Human-readable unique identifier for this runner (e.g. 'prime95', 'stress-ng')."""
-        ...
+    name: ClassVar[str]
+    # Signal asking the engine to stop gracefully; delivered to the whole process group.
+    stop_signal: ClassVar[int] = signal.SIGINT
+    # Engines that block-buffer or suppress output when stdout is not a terminal run on a PTY.
+    use_pty: ClassVar[bool] = False
+
+    def __init__(self, base_work_dir: str | None = None):
+        self.base_work_dir = base_work_dir
 
     @abc.abstractmethod
     def is_available(self) -> bool:
-        """Checks if the required binary and dependencies are installed and executable."""
-        ...
+        """Checks if the required binary is installed and executable."""
 
     @classmethod
     @abc.abstractmethod
     def add_cli_arguments(cls, parser: argparse.ArgumentParser) -> None:
         """Registers runner-specific CLI parameters into an argparse argument parser."""
-        ...
 
     @classmethod
-    def parse_parameters(cls, args: argparse.Namespace) -> tuple[dict[str, Any], str]:
-        """Parses runner parameters from CLI args, returning (runner_parameters_dict, profile_desc_str)."""
-        return {}, cls.__name__
+    @abc.abstractmethod
+    def parse_parameters(cls, args: argparse.Namespace) -> tuple[Any, str]:
+        """Validates runner CLI args, returning (parameters, profile description). Raises ValueError on bad input."""
 
     @abc.abstractmethod
-    def run_test(
-        self,
-        request: TestRequest,
-        listener: TestEventListener | None = None,
-    ) -> RunResult:
-        """
-        Executes a stress run on requested logical CPUs according to parameters in request.
-        Dispatches real-time progress to listener if provided. Returns structured RunResult.
-        """
-        ...
+    def _prepare(self, request: TestRequest, work_dir: str) -> list[str]:
+        """Writes engine configuration into work_dir and returns the command line to execute."""
 
+    @abc.abstractmethod
+    def _create_parser(self, request: TestRequest, work_dir: str, listener: TestEventListener) -> OutputParser:
+        """Creates the output parser for one run."""
 
-def parse_time(time_str: str) -> float:
-    """Parses time strings like '300', '300s', '5m', '1h' into seconds as float."""
-    time_str = time_str.strip().lower()
-    if time_str.endswith("s"):
-        return float(time_str[:-1])
-    if time_str.endswith("m"):
-        return float(time_str[:-1]) * 60.0
-    if time_str.endswith("h"):
-        return float(time_str[:-1]) * 3600.0
-    return float(time_str)
+    def _spawn(self, cmd: list[str], work_dir: str) -> tuple[subprocess.Popen, _ProcessOutput]:
+        # The child gets its own process group: terminal Ctrl+C reaches only the controller, which then stops
+        # the engine deliberately (and the whole group, including helper processes the engine may fork).
+        if self.use_pty:
+            master_fd, slave_fd = pty.openpty()
+            try:
+                proc = subprocess.Popen(cmd, cwd=work_dir, stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+                                        process_group=0)
+            except BaseException:
+                os.close(master_fd)
+                raise
+            finally:
+                os.close(slave_fd)
+            return proc, _ProcessOutput(master_fd)
 
+        proc = subprocess.Popen(cmd, cwd=work_dir, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, process_group=0)
+        return proc, _ProcessOutput(os.dup(proc.stdout.fileno()))
 
-def parse_step_time(val: str | int | float | None, default_seconds: float = 60.0) -> float:
-    """Parses step duration (e.g. '1m', '60s', '30s', or int/float) into seconds as float."""
-    if val is None:
-        return default_seconds
-    s = str(val).strip().lower()
-    if s.endswith("s"):
-        return float(s[:-1])
-    if s.endswith("m"):
-        return float(s[:-1]) * 60.0
-    if s.endswith("h"):
-        return float(s[:-1]) * 3600.0
-    num = float(s)
-    return num * 60.0 if num <= 10 else num
+    def run_test(self, request: TestRequest, context: RunContext | None = None) -> RunResult:
+        """Executes one stress run on the requested logical CPUs and returns its classified result."""
+        if not self.is_available():
+            raise RunnerUnavailableError(f"{self.name} binary is not available")
+        context = context or RunContext()
+        listener = context.listener
 
-
-def terminate_process(proc: subprocess.Popen, graceful: bool = True) -> None:
-    """Gracefully sends SIGINT to child process, falling back to SIGTERM/SIGKILL after timeout."""
-    if proc.poll() is not None:
-        return
-
-    sig = signal.SIGINT if graceful else signal.SIGTERM
-    try:
-        proc.send_signal(sig)
-    except OSError:
-        return
-
-    try:
-        proc.wait(timeout=5.0)
-    except subprocess.TimeoutExpired:
+        work_dir = tempfile.mkdtemp(prefix=f"zen_tuner_{self.name}_", dir=self.base_work_dir)
+        keep_work_dir = False
         try:
-            proc.kill()
-            proc.wait(timeout=2.0)
-        except OSError:
-            pass
+            cmd = self._prepare(request, work_dir)
+            parser = self._create_parser(request, work_dir, listener)
+            mce_events: list[MceEvent] = []
+            telemetry: CoreTelemetryMonitor | None = None
+            if context.smu_monitor is not None and request.core_idx is not None and context.smu_monitor.is_available():
+                telemetry = CoreTelemetryMonitor(context.smu_monitor, request.core_idx)
+
+            start = time.monotonic()
+            with KernelErrorMonitor(request.cpus) as kernel_mon:
+                with inherited_scheduling(request.cpus):
+                    proc, output = self._spawn(cmd, work_dir)
+                stop_reason: RunStatus | None = None
+                stop_deadline = 0.0
+                try:
+                    while True:
+                        for line in output.read_lines(POLL_INTERVAL_S):
+                            parser.handle_line(line)
+                        parser.poll()
+
+                        for ev in kernel_mon.poll():
+                            mce_events.append(ev)
+                            listener.on_hardware_error(ev)
+
+                        if telemetry is not None:
+                            alert = telemetry.poll()
+                            if alert is not None:
+                                listener.on_stretching_detected(alert)
+
+                        if proc.poll() is not None:
+                            drain_deadline = time.monotonic() + DRAIN_TIMEOUT_S
+                            while not output.eof and time.monotonic() < drain_deadline:
+                                for line in output.read_lines(POLL_INTERVAL_S):
+                                    parser.handle_line(line)
+                            parser.poll()
+                            break
+
+                        if stop_reason is None:
+                            if context.cancel.is_set():
+                                stop_reason = RunStatus.INTERRUPTED
+                            elif parser.errors:
+                                stop_reason = RunStatus.ERROR
+                            elif parser.done:
+                                stop_reason = RunStatus.PASS
+                            if stop_reason is not None:
+                                _signal_group(proc, self.stop_signal)
+                                stop_deadline = time.monotonic() + STOP_TIMEOUT_S
+                        elif time.monotonic() > stop_deadline:
+                            _signal_group(proc, signal.SIGKILL)
+                finally:
+                    terminate_process(proc, signal.SIGKILL)
+                    # Reap helper processes the engine may have left behind in its process group.
+                    _signal_group(proc, signal.SIGKILL)
+                    output.close()
+                    parser.close()
+                    if proc.stdout is not None:
+                        proc.stdout.close()
+            elapsed = time.monotonic() - start
+
+            status, message = self._classify(proc.returncode, stop_reason, parser, context)
+            keep_work_dir = status in (RunStatus.ERROR, RunStatus.CRASH)
+            return RunResult(
+                status=status,
+                tested_cpus=list(request.cpus),
+                completed_iterations=parser.completed_iterations,
+                elapsed_seconds=elapsed,
+                error_message=message,
+                errors=list(parser.errors),
+                mce_events=mce_events,
+                verified_steps=list(parser.verified_steps),
+                summary_line=parser.summary_line,
+                telemetry=telemetry.summary if telemetry else None,
+            )
+        finally:
+            if not keep_work_dir:
+                shutil.rmtree(work_dir, ignore_errors=True)
+
+    @staticmethod
+    def _classify(
+        returncode: int | None,
+        stop_reason: RunStatus | None,
+        parser: OutputParser,
+        context: RunContext,
+    ) -> tuple[RunStatus, str | None]:
+        if stop_reason == RunStatus.INTERRUPTED or context.cancel.is_set():
+            return RunStatus.INTERRUPTED, "Test interrupted by user"
+        if parser.errors:
+            return RunStatus.ERROR, parser.errors[0]
+        if stop_reason is None and returncode:
+            if returncode < 0:
+                sig = -returncode
+                return RunStatus.CRASH, f"Process terminated by signal {sig} ({signal.strsignal(sig)})"
+            return RunStatus.CRASH, f"Process exited abnormally with code {returncode}"
+        if parser.done:
+            return RunStatus.PASS, None
+        return RunStatus.UNVERIFIED, (
+            f"Process ended after {parser.completed_iterations} of {parser.target_iterations} verified iterations"
+        )
+
+
+@dataclass(frozen=True)
+class Engine:
+    """A stress runner paired with its validated parameters."""
+    runner: StressRunner
+    parameters: Any
+    profile: str

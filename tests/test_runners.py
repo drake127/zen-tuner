@@ -1,538 +1,490 @@
 """
-Unit tests for runner engines, parameter builders, and listener protocols.
+Tests for runner parameter validation, output parsers, and the shared process supervision loop.
+
+Supervision tests replace the engine binary with a lightweight Python script that mimics the observed engine
+behaviour (output format, stop signal handling) while going through the production PTY/pipe, scheduling and
+signalling code paths, so they neither take long nor load the CPU.
 """
 
+import argparse
 import os
-import unittest
-from zen_tuner import build_fft_config
-from runners import Prime95Runner, YCruncherRunner, get_runner, list_runners, parse_step_time, parse_time
-from runners.base import TestEventListener
-from runners.prime95 import strip_worker_prefix, PASSED_PATTERN
+import subprocess
+import sys
+import textwrap
+import threading
+import time
+
+import pytest
+
+from lib.models import RunStatus, TestRequest
+from runners import RUNNER_CLASSES, RunnerUnavailableError, get_runner, parse_duration
+from runners.base import RunContext
+from runners.prime95 import (
+    PRIME95_MAX_FFT_K,
+    FFTConfig,
+    Prime95OutputParser,
+    Prime95Params,
+    Prime95Runner,
+    build_fft_config,
+    parse_fft_size_k,
+    strip_worker_prefix,
+)
+from runners.y_cruncher import YCruncherOutputParser, YCruncherParams, YCruncherRunner, parse_algorithms
+
+ZEN_TUNER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "zen_tuner.py")
+ONE_CPU = [min(os.sched_getaffinity(0))]
+SUPPORTED_MODES = frozenset({"sse", "avx", "avx2"})
+
+YC_PARAMS = YCruncherParams(algorithms=("BBP",), seconds_per_test=1, memory_mb=None)
+PRIME95_PARAMS = Prime95Params(fft=FFTConfig(4, 4, 0, "4K"), test_time_min=1, mode=None)
 
 
-class DummyListener(TestEventListener):
-
-    def __init__(self):
-        self.lines = []
-        self.verified = []
-
-    def on_output_line(self, line: str) -> None:
-        self.lines.append(line)
-
-    def on_test_verified(self, iteration_name: str, completed_count: int) -> None:
-        self.verified.append((iteration_name, completed_count))
-
-    def on_stretching_detected(self, sample) -> None:
-        pass
-
-    def on_hardware_error(self, event) -> None:
-        pass
-
-    def on_grace_period_started(self, max_duration_s: float) -> None:
-        pass
+def parse_cli(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    for cls in RUNNER_CLASSES.values():
+        cls.add_cli_arguments(parser)
+    return parser.parse_args(argv)
 
 
-class TestRunners(unittest.TestCase):
+def feed(parser, lines: list[str]) -> None:
+    for line in lines:
+        parser.handle_line(line)
 
-    def test_parse_time(self):
-        self.assertEqual(parse_time("300"), 300.0)
-        self.assertEqual(parse_time("45s"), 45.0)
-        self.assertEqual(parse_time("5m"), 300.0)
-        self.assertEqual(parse_time("1h"), 3600.0)
 
-    def test_build_fft_config(self):
-        smallest = build_fft_config("smallest")
-        self.assertEqual(smallest.min_fft, 4)
-        self.assertEqual(smallest.max_fft, 21)
+def run(runner, params, listener, target: int = 1, context: RunContext | None = None):
+    context = context or RunContext()
+    context.listener = listener
+    request = TestRequest(cpus=ONE_CPU, target_iterations=target, core_idx=0, parameters=params)
+    return runner.run_test(request, context)
 
-        custom = build_fft_config("smallest", min_fft=128, max_fft=256, memory=1024)
-        self.assertEqual(custom.min_fft, 128)
-        self.assertEqual(custom.max_fft, 256)
-        self.assertEqual(custom.mem_mb, 1024)
 
-        range_cfg = build_fft_config("36-248")
-        self.assertEqual(range_cfg.min_fft, 36)
-        self.assertEqual(range_cfg.max_fft, 248)
+# Parameters
 
-    def test_strip_worker_prefix(self):
-        self.assertEqual(strip_worker_prefix("[Worker 2026-09-22T16:30:00] Test 1"), "[2026-09-22T16:30:00] Test 1")
-        self.assertEqual(
-            strip_worker_prefix("[Worker #1 2026-09-22T16:30:00] Self-test 4K passed!"),
-            "[2026-09-22T16:30:00] Self-test 4K passed!",
-        )
-        self.assertEqual(strip_worker_prefix("[Main thread 2026-09-22T16:30:00] Starting"), "[2026-09-22T16:30:00] Starting")
-        self.assertEqual(strip_worker_prefix("[2026-09-22T16:30:00] Clean line"), "[2026-09-22T16:30:00] Clean line")
+@pytest.mark.parametrize("text, seconds", [("300", 300.0), ("10", 10.0), ("45s", 45.0), ("5m", 300.0), ("1h", 3600.0)])
+def test_parse_duration(text, seconds):
+    assert parse_duration(text) == seconds
 
-    def test_runner_registry(self):
-        self.assertIn("prime95", list_runners())
-        runner = get_runner("prime95")
-        self.assertEqual(runner.name, "prime95")
 
-        with self.assertRaises(ValueError):
-            get_runner("non_existent_runner")
+@pytest.mark.parametrize("text", ["", "abc", "0", "-5m"])
+def test_parse_duration_rejects_invalid(text):
+    with pytest.raises(ValueError):
+        parse_duration(text)
 
-    def test_prime95_resolve_binary(self):
-        runner = Prime95Runner()
-        self.assertIsNotNone(runner.mprime_bin)
-        self.assertTrue(runner.mprime_bin.endswith("contrib/prime95/mprime") or runner.mprime_bin.endswith("mprime"))
-        self.assertTrue(runner.is_available())
 
-    def test_listener_events(self):
-        listener = DummyListener()
-        listener.on_output_line("Test line 1")
-        listener.on_test_verified("4K", 1)
+def test_build_fft_config_presets_and_ranges():
+    assert (build_fft_config().min_fft, build_fft_config().max_fft) == (4, 21)
+    assert build_fft_config("small", mode="avx").min_fft == 36
+    assert build_fft_config("small", mode="sse").min_fft == 40
+    rng = build_fft_config("36-248")
+    assert (rng.min_fft, rng.max_fft, rng.mem_mb) == (36, 248, 0)
+    assert build_fft_config("large").mem_mb == 2048
+    assert build_fft_config("large", memory_mb=0).mem_mb == 0
 
-        self.assertEqual(listener.lines, ["Test line 1"])
-        self.assertEqual(listener.verified, [("4K", 1)])
 
-    def test_cli_test_iterations_and_time(self):
-        import subprocess
-        import sys
+def test_build_fft_config_explicit_bounds():
+    only_min = build_fft_config(min_fft=36)
+    assert (only_min.min_fft, only_min.max_fft) == (36, PRIME95_MAX_FFT_K)
+    only_max = build_fft_config(max_fft=248)
+    assert (only_max.min_fft, only_max.max_fft) == (4, 248)
+    custom = build_fft_config(min_fft=128, max_fft=256, memory_mb=1024)
+    assert (custom.min_fft, custom.max_fft, custom.mem_mb) == (128, 256, 1024)
 
-        res = subprocess.run(
-            [sys.executable, "zen_tuner.py", "--help"],
-            capture_output=True,
-            text=True,
-        )
-        self.assertEqual(res.returncode, 0)
-        self.assertIn("--test-iterations", res.stdout)
-        self.assertIn("--time", res.stdout)
 
-    def test_cli_stop_on_error_flag(self):
-        import subprocess
-        import sys
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"preset": "smal"},
+        {"preset": "248-36"},
+        {"min_fft": 300, "max_fft": 200},
+        {"max_fft": PRIME95_MAX_FFT_K + 1},
+        {"min_fft": 1},
+        {"preset": "small", "min_fft": 36},
+        {"memory_mb": -1},
+    ],
+)
+def test_build_fft_config_rejects_invalid_input(kwargs):
+    with pytest.raises(ValueError):
+        build_fft_config(**kwargs)
 
-        res = subprocess.run(
-            [sys.executable, "zen_tuner.py", "--help"],
-            capture_output=True,
-            text=True,
-        )
-        self.assertEqual(res.returncode, 0)
-        self.assertIn("--stop-on-error", res.stdout)
-        self.assertIn("--runner", res.stdout)
-        self.assertIn("--prime-fft", res.stdout)
-        self.assertIn("--prime-memory", res.stdout)
-        self.assertIn("--prime-test-time", res.stdout)
-        self.assertIn("--yc-algorithms", res.stdout)
-        self.assertIn("--yc-memory", res.stdout)
-        self.assertIn("--yc-test-time", res.stdout)
-        self.assertNotIn("--mprime", res.stdout)
 
-    def test_passed_pattern_single_and_multithread(self):
-        # Single-threaded
-        m_single = PASSED_PATTERN.search("Self-test 4K passed!")
-        self.assertIsNotNone(m_single)
-        self.assertEqual(m_single.group(1), "4K")
-        self.assertIsNone(m_single.group(2))
-        self.assertIsNone(m_single.group(3))
+@pytest.fixture
+def cpu_modes(monkeypatch):
+    monkeypatch.setattr("runners.prime95.detect_cpu_instruction_sets", lambda: SUPPORTED_MODES)
 
-        # Multi-threaded format from Prime95
-        line_t1 = "[2026-09-22T22:47:45] Self-test 36K (thread 1 of 2) passed!"
-        m_t1 = PASSED_PATTERN.search(line_t1)
-        self.assertIsNotNone(m_t1)
-        self.assertEqual(m_t1.group(1), "36K")
-        self.assertEqual(m_t1.group(2), "1")
-        self.assertEqual(m_t1.group(3), "2")
 
-        line_t2 = "[2026-09-22T22:47:45] Self-test 36K (thread 2 of 2) passed!"
-        m_t2 = PASSED_PATTERN.search(line_t2)
-        self.assertIsNotNone(m_t2)
-        self.assertEqual(m_t2.group(1), "36K")
-        self.assertEqual(m_t2.group(2), "2")
-        self.assertEqual(m_t2.group(3), "2")
+def test_prime95_parse_parameters(cpu_modes):
+    args = parse_cli(["--prime-fft", "small", "--prime-test-time", "2m", "--prime-memory", "1024"])
+    params, desc = Prime95Runner.parse_parameters(args)
+    assert params.test_time_min == 2
+    assert params.fft.mem_mb == 1024
+    assert params.mode == "avx2"
+    assert "Small FFTs" in desc
 
-    def test_multithread_run_test_target_iterations(self):
+
+def test_prime95_rejects_unsupported_mode(cpu_modes):
+    with pytest.raises(ValueError, match="not supported"):
+        Prime95Runner.parse_parameters(parse_cli(["--prime-mode", "avx512"]))
+
+
+def test_prime95_test_time_in_whole_minutes(cpu_modes):
+    with pytest.raises(ValueError, match="whole number of minutes"):
+        Prime95Runner.parse_parameters(parse_cli(["--prime-test-time", "90s"]))
+    params, _ = Prime95Runner.parse_parameters(parse_cli(["--prime-test-time", "180"]))
+    assert params.test_time_min == 3
+
+
+def test_parse_algorithms():
+    assert parse_algorithms("breadpit") == ("BBP", "SFTv4", "VT3")
+    assert len(parse_algorithms("ALL")) == 8
+    assert parse_algorithms("bbp, sftv4") == ("BBP", "SFTv4")
+    with pytest.raises(ValueError, match="FOO"):
+        parse_algorithms("BBP,FOO")
+    with pytest.raises(ValueError):
+        parse_algorithms(" , ")
+
+
+def test_y_cruncher_parse_parameters():
+    params, desc = YCruncherRunner.parse_parameters(parse_cli([]))
+    assert params == YCruncherParams(("BBP", "SFTv4", "VT3"), 60, None)
+    assert "BBP,SFTv4,VT3" in desc
+
+    args = parse_cli(["--yc-algorithms", "BKT,FFTv4", "--yc-test-time", "30", "--yc-memory", "2048"])
+    assert YCruncherRunner.parse_parameters(args)[0] == YCruncherParams(("BKT", "FFTv4"), 30, 2048)
+
+
+@pytest.mark.parametrize("argv", [["--yc-test-time", "1.5"], ["--yc-memory", "-1"]])
+def test_y_cruncher_rejects_invalid_parameters(argv):
+    with pytest.raises(ValueError):
+        YCruncherRunner.parse_parameters(parse_cli(argv))
+
+
+def test_runner_registry():
+    assert sorted(RUNNER_CLASSES) == ["prime95", "y-cruncher"]
+    assert get_runner("prime95").name == "prime95"
+    assert get_runner("Y-Cruncher").name == "y-cruncher"
+    with pytest.raises(ValueError):
+        get_runner("non_existent_runner")
+
+
+def test_bundled_binaries_are_resolved():
+    assert Prime95Runner().is_available()
+    assert YCruncherRunner().is_available()
+
+
+def test_cli_help_lists_options():
+    res = subprocess.run([sys.executable, ZEN_TUNER, "--help"], capture_output=True, text=True, timeout=30)
+    assert res.returncode == 0
+    for option in ("--test-iterations", "--stop-on-error", "--runner", "--prime-fft", "--prime-memory",
+                   "--prime-test-time", "--yc-algorithms", "--yc-memory", "--yc-test-time"):
+        assert option in res.stdout
+    assert "--time " not in res.stdout
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [["--test-iterations", "0"], ["--prime-fft", "smal"], ["--runner", "y-cruncher", "--yc-algorithms", "FOO"]],
+)
+def test_cli_rejects_invalid_values(argv):
+    # Validation fails before any engine starts; the timeout guards against accidentally launching a stress run
+    res = subprocess.run([sys.executable, ZEN_TUNER, *argv], capture_output=True, text=True, timeout=30)
+    assert res.returncode == 2
+
+
+# Configuration files
+
+@pytest.mark.parametrize(
+    "mode, expected",
+    [
+        ("sse", ("CpuSupportsAVX=0", "CpuSupportsAVX2=0", "CpuSupportsAVX512F=0", "CpuSupportsFMA3=0")),
+        ("avx", ("CpuSupportsAVX=1", "CpuSupportsAVX2=0")),
+        ("avx2", ("CpuSupportsAVX2=1", "CpuSupportsAVX512F=0", "CpuSupportsFMA3=1")),
+        ("avx512", ("CpuSupportsAVX512F=1", "CpuSupportsFMA4=0")),
+    ],
+)
+def test_prime95_config_instruction_modes(tmp_path, mode, expected):
+    Prime95Runner.write_config(str(tmp_path), FFTConfig(4, 4, 0, ""), num_threads=1, test_time_min=1, mode=mode)
+    content = (tmp_path / "prime.txt").read_text()
+    for item in expected:
+        assert item in content
+    assert not (tmp_path / "local.txt").exists()
+
+
+def test_prime95_config_defaults(tmp_path):
+    Prime95Runner.write_config(str(tmp_path), FFTConfig(40, 248, 0, ""), num_threads=2, test_time_min=3, mode=None)
+    content = (tmp_path / "prime.txt").read_text()
+    assert "CpuSupports" not in content
+    for item in ("MinTortureFFT=40", "MaxTortureFFT=248", "TortureTime=3", "TortureHyperthreading=1"):
+        assert item in content
+
+
+def test_y_cruncher_config(tmp_path):
+    cfg_path = YCruncherRunner.write_config(str(tmp_path), [0, 12], YCruncherParams(("BBP", "SFTv4", "VT3"), 30, 128))
+    content = open(cfg_path, encoding="utf-8").read()
+    assert 'Action : "StressTest"' in content
+    assert "LogicalCores : [0 12]" in content
+    assert "TotalMemory : 134217728" in content
+    assert "SecondsPerTest : 30" in content
+    # Runs until the supervisor stops it after the last requested iteration
+    assert "SecondsTotal : 0" in content
+    for algo in ("BBP", "SFTv4", "VT3"):
+        assert f'"{algo}"' in content
+
+
+# Output parsers
+
+def prime95_parser(listener, fft: FFTConfig, target: int = 1) -> Prime95OutputParser:
+    return Prime95OutputParser(fft, target, listener, "/nonexistent/results.txt")
+
+
+@pytest.mark.parametrize(
+    "line, expected",
+    [
+        ("[Worker 2026-09-22T16:30:00] Test 1", "[2026-09-22T16:30:00] Test 1"),
+        ("[Worker #1 2026-09-22T16:30:00] Self-test 4K passed!", "[2026-09-22T16:30:00] Self-test 4K passed!"),
+        ("[Main thread 2026-09-22T16:30:00] Starting", "[2026-09-22T16:30:00] Starting"),
+        ("[2026-09-22T16:30:00] Clean line", "[2026-09-22T16:30:00] Clean line"),
+    ],
+)
+def test_strip_worker_prefix(line, expected):
+    assert strip_worker_prefix(line) == expected
+
+
+@pytest.mark.parametrize("name, size_k", [("4608", 4.5), ("5K", 5.0), ("4M", 4096.0)])
+def test_fft_sizes_in_elements_and_k(name, size_k):
+    assert parse_fft_size_k(name) == size_k
+
+
+def test_element_sized_fft_does_not_complete_range(listener):
+    # mprime 30.19 output for a 4K-5K range: the 4.5K FFT is reported in elements as "4608"
+    parser = prime95_parser(listener, FFTConfig(4, 5, 0, ""))
+    feed(parser, ["[2026-09-23T15:02:44] Self-test 4608 passed!"])
+    assert parser.completed_iterations == 0
+    feed(parser, ["[2026-09-23T15:03:44] Self-test 5K passed!"])
+    assert parser.completed_iterations == 1
+    assert listener.verified == [("4608", 0), ("5K", 1)]
+
+
+def test_range_pass_completes_on_wrap(listener):
+    parser = prime95_parser(listener, FFTConfig(36, 248, 0, ""))
+    feed(parser, [f"Self-test {size} passed!" for size in ("36K", "40K", "240K", "36K", "40K")])
+    # 240K never reaches 248K: the pass completes when the size wraps back to 36K
+    assert parser.completed_iterations == 1
+    assert listener.verified[2:4] == [("240K", 0), ("36K", 1)]
+
+
+def test_smt_steps_count_once_all_threads_passed(listener):
+    parser = prime95_parser(listener, FFTConfig(36, 36, 0, ""), target=2)
+    feed(parser, [
+        "[2026-09-22T22:47:45] Self-test 36K (thread 1 of 2) passed!",
+        "[2026-09-22T22:47:45] Self-test 36K (thread 2 of 2) passed!",
+        "[2026-09-22T22:48:53] Self-test 36K (thread 2 of 2) passed!",
+    ])
+    assert parser.completed_iterations == 1
+    feed(parser, ["[2026-09-22T22:48:53] Self-test 36K (thread 1 of 2) passed!"])
+    assert parser.done
+    assert listener.verified == [("36K", 1), ("36K", 2)]
+
+
+def test_untagged_steps_count_individually(listener):
+    parser = prime95_parser(listener, FFTConfig(4, 4, 0, ""), target=2)
+    feed(parser, ["Self-test 4K passed!", "Self-test 4K passed!"])
+    assert parser.completed_iterations == 2
+
+
+def test_prime95_errors(listener):
+    parser = prime95_parser(listener, FFTConfig(4, 21, 0, ""))
+    feed(parser, ["[2026-09-23T15:01:48] Torture Test completed 3 tests in 3 minutes - 0 errors, 0 warnings."])
+    assert parser.errors == []
+    assert "Torture Test completed" in parser.summary_line
+
+    feed(parser, ["[2026-09-23T15:02:00] FATAL ERROR: Rounding was 0.5, expected less than 0.4",
+                  "[2026-09-23T15:02:01] Torture Test completed 3 tests in 3 minutes - 1 errors, 0 warnings."])
+    assert len(parser.errors) == 3
+    assert parser.errors[0].startswith("FATAL ERROR")
+
+
+def test_results_file_errors_are_deduplicated(tmp_path, listener):
+    results = tmp_path / "results.txt"
+    parser = Prime95OutputParser(FFTConfig(4, 21, 0, ""), 1, listener, str(results))
+    parser.poll()
+    message = "Hardware failure detected running 4K FFT size, consult stress.txt file."
+    results.write_text(f"[2026-09-23T15:02:00]\n{message}\n")
+    parser.poll()
+    feed(parser, [f"[2026-09-23T15:02:00] {message}"])
+    parser.close()
+    assert parser.errors == [message]
+
+
+def test_y_cruncher_single_algorithm_iterations(listener):
+    parser = YCruncherOutputParser(algorithm_count=1, target_iterations=3, listener=listener)
+    feed(parser, ["Running BBP: Passed  Test Speed:  1.62 * 10^08  terms / sec"] * 3)
+    assert parser.done
+    assert listener.verified == [("BBP", 1), ("BBP", 2), ("BBP", 3)]
+
+
+def test_y_cruncher_iteration_spans_all_algorithms(listener):
+    parser = YCruncherOutputParser(algorithm_count=2, target_iterations=1, listener=listener)
+    feed(parser, ["Iteration: 0  Total Elapsed Time: 0.000 seconds  ( 0.000 minutes )",
+                  "Running BBP: Passed  Test Speed:  1.62 * 10^08  terms / sec"])
+    assert not parser.done
+    feed(parser, ["Running SFTv4: Passed  Test Speed: 3.65 * 10^09  bits / sec"])
+    assert parser.done
+
+
+@pytest.mark.parametrize("line", ["Running BBP: Failed  Test Speed: 0", "Exception Encountered: InvalidParametersException"])
+def test_y_cruncher_errors(listener, line):
+    parser = YCruncherOutputParser(algorithm_count=1, target_iterations=1, listener=listener)
+    feed(parser, [line])
+    assert len(parser.errors) == 1
+
+
+# Supervision with scripted engines
+
+def scripted(runner_cls: type, script: str, **kwargs):
+    """Instance of runner_cls whose engine binary is replaced by a Python script."""
+
+    class ScriptedRunner(runner_cls):
+        def _prepare(self, request: TestRequest, work_dir: str) -> list[str]:
+            return [sys.executable, "-u", "-c", textwrap.dedent(script)]
+
+    binary_kw = "mprime_path" if runner_cls is Prime95Runner else "binary_path"
+    return ScriptedRunner(**{binary_kw: sys.executable}, **kwargs)
+
+
+# Mimics y-cruncher: ignores SIGINT, runs forever until SIGTERM
+Y_CRUNCHER_SCRIPT = """
+    import signal, time
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    print("Running from console...")
+    for i in range({passes}):
+        print(f"Iteration: {{i}}  Total Elapsed Time: 0.000 seconds  ( 0.000 minutes )")
+        print("Running BBP: Passed  Test Speed:  1.62 * 10^08  terms / sec")
+    time.sleep(60)
+"""
+
+# Mimics mprime: reports passes, stops cleanly with a summary on SIGINT
+PRIME95_SCRIPT = """
+    import signal, sys, time
+    def stop(signum, frame):
+        print("Torture Test completed {passes} tests in 1 minutes - 0 errors, 0 warnings.")
+        sys.exit(0)
+    signal.signal(signal.SIGINT, stop)
+    print("Worker starting")
+    for _ in range({passes}):
+        print("Self-test 4K passed!")
+    time.sleep(60)
+"""
+
+
+def test_y_cruncher_stopped_after_last_iteration(no_kmsg, listener):
+    result = run(scripted(YCruncherRunner, Y_CRUNCHER_SCRIPT.format(passes=2)), YC_PARAMS, listener, target=2)
+    assert result.status == RunStatus.PASS
+    assert result.completed_iterations == 2
+    assert listener.verified == [("BBP", 1), ("BBP", 2)]
+    assert "Running from console..." in listener.lines
+    assert result.elapsed_seconds < 5.0
+
+
+def test_prime95_stopped_after_last_iteration(no_kmsg, listener):
+    result = run(scripted(Prime95Runner, PRIME95_SCRIPT.format(passes=1)), PRIME95_PARAMS, listener)
+    assert result.status == RunStatus.PASS
+    # Output printed while stopping is still parsed
+    assert "0 errors" in result.summary_line
+
+
+@pytest.mark.parametrize(
+    "runner_cls, script, params",
+    [(YCruncherRunner, Y_CRUNCHER_SCRIPT, YC_PARAMS), (Prime95Runner, PRIME95_SCRIPT, PRIME95_PARAMS)],
+    ids=["y-cruncher", "prime95"],
+)
+def test_cancel_interrupts_run(no_kmsg, listener, runner_cls, script, params):
+    context = RunContext()
+    threading.Timer(0.3, context.cancel.set).start()
+    result = run(scripted(runner_cls, script.format(passes=0)), params, listener, context=context)
+    assert result.status == RunStatus.INTERRUPTED
+    assert result.elapsed_seconds < 5.0
+
+
+@pytest.mark.parametrize(
+    "script, status, message",
+    [
+        ('print("Self-test 4K passed!")', RunStatus.UNVERIFIED, "1 of 2"),
+        ('print("Self-test 4K passed!"); print("FATAL ERROR: Rounding was 0.5, expected less than 0.4")',
+         RunStatus.ERROR, "FATAL ERROR"),
+        ("import os, signal; os.kill(os.getpid(), signal.SIGSEGV)", RunStatus.CRASH, "signal 11"),
+        ("raise SystemExit(3)", RunStatus.CRASH, "code 3"),
+    ],
+    ids=["early-exit", "error-before-exit", "signal", "exit-code"],
+)
+def test_exit_classification(no_kmsg, listener, script, status, message):
+    result = run(scripted(Prime95Runner, script), PRIME95_PARAMS, listener, target=2)
+    assert result.status == status
+    assert message in result.error_message
+
+
+def test_y_cruncher_config_error(no_kmsg, listener):
+    # Observed y-cruncher reaction to an unknown test name: message and exit code 0
+    script = 'print("Exception Encountered: InvalidParametersException"); print("Unknown Test: FOO")'
+    result = run(scripted(YCruncherRunner, script), YC_PARAMS, listener)
+    assert result.status == RunStatus.ERROR
+
+
+def test_stop_escalates_to_sigkill(no_kmsg, listener, monkeypatch):
+    monkeypatch.setattr("runners.base.STOP_TIMEOUT_S", 0.3)
+    script = """
+        import signal, time
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        print("Self-test 4K passed!")
+        time.sleep(60)
+    """
+    start = time.monotonic()
+    result = run(scripted(Prime95Runner, script), PRIME95_PARAMS, listener)
+    assert time.monotonic() - start < 5.0
+    assert result.status == RunStatus.PASS
+
+
+def test_child_inherits_affinity_in_own_process_group(no_kmsg, listener):
+    script = """
         import os
-        import tempfile
-        import unittest.mock
-        from lib.models import TestRequest
-
-        r_fd, w_fd = os.pipe()
-        with os.fdopen(w_fd, "w") as w:
-            w.write(
-                "[2026-09-22T22:47:45] Self-test 36K (thread 1 of 2) passed!\n"
-                "[2026-09-22T22:47:45] Self-test 36K (thread 2 of 2) passed!\n"
-                "[2026-09-22T22:48:53] Self-test 36K (thread 1 of 2) passed!\n"
-                "[2026-09-22T22:48:53] Self-test 36K (thread 2 of 2) passed!\n"
-            )
-
-        fake_proc = unittest.mock.MagicMock()
-        fake_proc.stdout = os.fdopen(r_fd, "r")
-        fake_proc.pid = 99999
-
-        calls = 0
-
-        def make_poll():
-            nonlocal calls
-            calls += 1
-            return None if calls < 4 else 0
-
-        fake_proc.poll.side_effect = make_poll
-
-        with tempfile.TemporaryDirectory() as tmpdir, \
-             unittest.mock.patch("subprocess.Popen", return_value=fake_proc), \
-             unittest.mock.patch("os.sched_setaffinity"):
-            runner = Prime95Runner(base_work_dir=tmpdir)
-            req = TestRequest(cpus=[0, 12], target_iterations=2, graceful=True, parameters={})
-            listener = DummyListener()
-            res = runner.run_test(req, listener=listener)
-
-            self.assertTrue(res.passed)
-            self.assertEqual(res.status, "PASS")
-            self.assertEqual(res.completed_tests, 2)
-            self.assertEqual(len(listener.verified), 2)
-            self.assertEqual(listener.verified[0], ("36K", 1))
-            self.assertEqual(listener.verified[1], ("36K", 2))
-
-
-    def test_prime95_write_config_instruction_modes(self):
-        import tempfile
-        from runners.prime95 import FFTConfig
-
-        cfg = FFTConfig(min_fft=4, max_fft=4, mem_mb=0, desc="Smallest")
-        runner = Prime95Runner()
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # SSE mode
-            runner.write_config(tmpdir, cfg, num_threads=1, test_time_min=1, mode="sse")
-            with open(os.path.join(tmpdir, "prime.txt")) as f:
-                content = f.read()
-            self.assertIn("CpuSupportsAVX=0", content)
-            self.assertIn("CpuSupportsAVX2=0", content)
-            self.assertIn("CpuSupportsAVX512F=0", content)
-            self.assertIn("CpuSupportsFMA3=0", content)
-
-            with open(os.path.join(tmpdir, "local.txt")) as f:
-                local_content = f.read()
-            self.assertIn("CpuSupportsAVX=0", local_content)
-            self.assertIn("CpuSupportsAVX2=0", local_content)
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # AVX mode
-            runner.write_config(tmpdir, cfg, num_threads=1, test_time_min=1, mode="avx")
-            with open(os.path.join(tmpdir, "prime.txt")) as f:
-                content = f.read()
-            self.assertIn("CpuSupportsAVX=1", content)
-            self.assertIn("CpuSupportsAVX2=0", content)
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # AVX2 mode
-            runner.write_config(tmpdir, cfg, num_threads=1, test_time_min=1, mode="avx2")
-            with open(os.path.join(tmpdir, "prime.txt")) as f:
-                content = f.read()
-            self.assertIn("CpuSupportsAVX=1", content)
-            self.assertIn("CpuSupportsAVX2=1", content)
-            self.assertIn("CpuSupportsAVX512F=0", content)
-            self.assertIn("CpuSupportsFMA3=1", content)
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Default / auto mode (mode=None)
-            runner.write_config(tmpdir, cfg, num_threads=1, test_time_min=1, mode=None)
-            with open(os.path.join(tmpdir, "prime.txt")) as f:
-                content = f.read()
-            self.assertNotIn("CpuSupportsAVX", content)
-            self.assertFalse(os.path.exists(os.path.join(tmpdir, "local.txt")))
-
-    def test_cli_instruction_modes(self):
-        import argparse
-        parser = argparse.ArgumentParser()
-        Prime95Runner.add_cli_arguments(parser)
-
-        args_sse = parser.parse_args(["--prime-mode", "sse"])
-        self.assertEqual(args_sse.prime_mode, "sse")
-
-        args_avx = parser.parse_args(["--prime-mode", "avx"])
-        self.assertEqual(args_avx.prime_mode, "avx")
-
-        args_avx2 = parser.parse_args(["--prime-mode", "avx2"])
-        self.assertEqual(args_avx2.prime_mode, "avx2")
-
-        args_avx512 = parser.parse_args(["--prime-mode", "avx512"])
-        self.assertEqual(args_avx512.prime_mode, "avx512")
-
-        args_default = parser.parse_args([])
-        self.assertIsNone(args_default.prime_mode)
-
-    def test_sse_small_fft_fallback(self):
-        # AVX modes small preset uses 36K-248K
-        cfg_avx = build_fft_config("small", mode="avx")
-        self.assertEqual(cfg_avx.min_fft, 36)
-        self.assertEqual(cfg_avx.max_fft, 248)
-
-        # SSE mode small preset uses 40K-248K
-        cfg_sse = build_fft_config("small", mode="sse")
-        self.assertEqual(cfg_sse.min_fft, 40)
-        self.assertEqual(cfg_sse.max_fft, 248)
-
-        # write_config should write the exact resolved bounds
-        import tempfile
-        runner = Prime95Runner()
-        with tempfile.TemporaryDirectory() as tmpdir:
-            runner.write_config(tmpdir, cfg_sse, num_threads=1, test_time_min=1, mode="sse")
-            with open(os.path.join(tmpdir, "prime.txt")) as f:
-                content = f.read()
-            self.assertIn("MinTortureFFT=40", content)
-            self.assertIn("MaxTortureFFT=248", content)
-
-    def test_matrix_explicit_modes(self):
-        from runners import FFT_PRESET_MATRIX
-        for preset_name, modes in FFT_PRESET_MATRIX.items():
-            for mode_name in ("sse", "avx", "avx2", "avx512"):
-                self.assertIn(mode_name, modes, f"Preset {preset_name} missing {mode_name}")
-                cfg = modes[mode_name]
-                self.assertGreater(cfg.max_fft, 0)
-                self.assertGreater(cfg.min_fft, 0)
-                self.assertLessEqual(cfg.min_fft, cfg.max_fft)
-
-    def test_set_based_test_completion(self):
-        import os
-        import tempfile
-        import unittest.mock
-        from lib.models import TestRequest
-
-        # Test that sub-FFT steps do not complete a test until the range completes
-        r_fd, w_fd = os.pipe()
-        with os.fdopen(w_fd, "w") as w:
-            w.write(
-                "[2026-09-22T22:47:45] Self-test 36K passed!\n"
-                "[2026-09-22T22:48:00] Self-test 40K passed!\n"
-                "[2026-09-22T22:48:30] Self-test 248K passed!\n"
-            )
-
-        fake_proc = unittest.mock.MagicMock()
-        fake_proc.stdout = os.fdopen(r_fd, "r")
-        fake_proc.pid = 99998
-        calls = 0
-
-        def make_poll():
-            nonlocal calls
-            calls += 1
-            return None if calls < 4 else 0
-
-        fake_proc.poll.side_effect = make_poll
-
-        with tempfile.TemporaryDirectory() as tmpdir, \
-             unittest.mock.patch("subprocess.Popen", return_value=fake_proc), \
-             unittest.mock.patch("os.sched_setaffinity"):
-            runner = Prime95Runner(base_work_dir=tmpdir)
-            cfg = build_fft_config("small", mode="avx2")  # 36K-248K
-            req = TestRequest(cpus=[0], target_iterations=1, graceful=True, parameters={"fft_config": cfg})
-            listener = DummyListener()
-            res = runner.run_test(req, listener=listener)
-
-            self.assertTrue(res.passed)
-            self.assertEqual(res.status, "PASS")
-            # All 3 FFTs were verified, but only 1 full set completed
-            self.assertEqual(res.completed_tests, 1)
-            self.assertEqual(len(res.verified_ffts), 3)
-            self.assertEqual(listener.verified, [("36K", 0), ("40K", 0), ("248K", 1)])
-
-    def test_parse_step_time(self):
-        self.assertEqual(parse_step_time("30s"), 30.0)
-        self.assertEqual(parse_step_time("1m"), 60.0)
-        self.assertEqual(parse_step_time("2m"), 120.0)
-        self.assertEqual(parse_step_time("1h"), 3600.0)
-        self.assertEqual(parse_step_time(None, default_seconds=45.0), 45.0)
-        # Integer <= 10 without unit treated as minutes for backward compatibility
-        self.assertEqual(parse_step_time("1"), 60.0)
-        self.assertEqual(parse_step_time("60"), 60.0)
-
-    def test_y_cruncher_registry_and_discovery(self):
-        self.assertIn("y-cruncher", list_runners())
-        self.assertIn("ycruncher", list_runners())
-        runner = get_runner("y-cruncher")
-        self.assertEqual(runner.name, "y-cruncher")
-        self.assertIsNotNone(runner.y_cruncher_bin)
-        self.assertTrue(runner.is_available())
-
-    def test_y_cruncher_write_config(self):
-        import tempfile
-        runner = YCruncherRunner()
-        with tempfile.TemporaryDirectory() as tmpdir:
-            cfg_path = runner.write_config(
-                work_dir=tmpdir,
-                cpus=[0, 12],
-                algorithms=["BBP", "SFTv4", "VT3"],
-                seconds_per_test=30,
-                seconds_total=90,
-                memory_mb=128,
-            )
-            self.assertTrue(os.path.exists(cfg_path))
-            with open(cfg_path, "r", encoding="utf-8") as f:
-                content = f.read()
-
-            self.assertIn('Action : "StressTest"', content)
-            self.assertIn("LogicalCores : [0 12]", content)
-            self.assertIn("TotalMemory : 134217728", content)  # 128 * 1024 * 1024
-            self.assertIn("SecondsPerTest : 30", content)
-            self.assertIn("SecondsTotal : 90", content)
-            self.assertIn('"BBP"', content)
-            self.assertIn('"SFTv4"', content)
-            self.assertIn('"VT3"', content)
-
-    def test_y_cruncher_parse_parameters(self):
-        import argparse
-        parser = argparse.ArgumentParser()
-        YCruncherRunner.add_cli_arguments(parser)
-
-        # Default args
-        args = parser.parse_args([])
-        params, desc = YCruncherRunner.parse_parameters(args)
-        self.assertEqual(params["algorithms"], ["BBP", "SFTv4", "VT3"])
-        self.assertEqual(params["seconds_per_test"], 60)
-        self.assertIsNone(params["memory_mb"])
-        self.assertIn("BBP,SFTv4,VT3", desc)
-
-        # Custom args with --yc- prefixes
-        args2 = parser.parse_args(["--yc-algorithms", "BKT,FFTv4", "--yc-test-time", "30s", "--yc-memory", "2048"])
-        params2, desc2 = YCruncherRunner.parse_parameters(args2)
-        self.assertEqual(params2["algorithms"], ["BKT", "FFTv4"])
-        self.assertEqual(params2["seconds_per_test"], 30)
-        self.assertEqual(params2["memory_mb"], 2048)
-        self.assertIn("BKT,FFTv4", desc2)
-
-        # Preset 'all'
-        args3 = parser.parse_args(["--yc-algorithms", "all"])
-        params3, desc3 = YCruncherRunner.parse_parameters(args3)
-        self.assertEqual(len(params3["algorithms"]), 8)
-
-    def test_prime95_parse_parameters(self):
-        import argparse
-        parser = argparse.ArgumentParser()
-        Prime95Runner.add_cli_arguments(parser)
-
-        args = parser.parse_args(["--prime-fft", "small", "--prime-test-time", "2m", "--prime-memory", "1024"])
-        params, desc = Prime95Runner.parse_parameters(args)
-        self.assertEqual(params["fft_preset"], "small")
-        self.assertEqual(params["test_time_min"], 2)
-        self.assertEqual(params["fft_config"].mem_mb, 1024)
-        self.assertIn("Small FFTs", desc)
-
-    def test_y_cruncher_run_test_mocked_success(self):
-        import tempfile
-        import unittest.mock
-        from lib.models import TestRequest
-
-        r_fd, w_fd = os.pipe()
-        with os.fdopen(w_fd, "w") as w:
-            w.write(
-                "Running BBP: Passed  Test Speed: 1.23 * 10^07 bits / sec\n"
-                "Running SFTv4: Passed  Test Speed: 4.56 * 10^07 bits / sec\n"
-            )
-
-        fake_proc = unittest.mock.MagicMock()
-        fake_proc.stdout = os.fdopen(r_fd, "r")
-        fake_proc.pid = 99997
-        calls = 0
-
-        def make_poll():
-            nonlocal calls
-            calls += 1
-            return None if calls < 4 else 0
-
-        fake_proc.poll.side_effect = make_poll
-
-        with tempfile.TemporaryDirectory() as tmpdir, \
-             unittest.mock.patch("subprocess.Popen", return_value=fake_proc), \
-             unittest.mock.patch("os.sched_setaffinity"):
-            runner = YCruncherRunner(base_work_dir=tmpdir)
-            req = TestRequest(
-                cpus=[0],
-                target_iterations=1,
-                parameters={"algorithms": ["BBP", "SFTv4"]},
-                graceful=True,
-            )
-            listener = DummyListener()
-            res = runner.run_test(req, listener=listener)
-
-            self.assertTrue(res.passed)
-            self.assertEqual(res.status, "PASS")
-            self.assertEqual(res.completed_tests, 2)
-            self.assertEqual(res.verified_ffts, ["BBP", "SFTv4"])
-            self.assertEqual(listener.verified, [("BBP", 1), ("SFTv4", 2)])
-
-    def test_y_cruncher_run_test_mocked_failure(self):
-        import tempfile
-        import unittest.mock
-        from lib.models import TestRequest
-
-        r_fd, w_fd = os.pipe()
-        with os.fdopen(w_fd, "w") as w:
-            w.write(
-                "Running BBP: Failed  Test Speed: 0\n"
-                "Stress test failed with 1 error.\n"
-            )
-
-        fake_proc = unittest.mock.MagicMock()
-        fake_proc.stdout = os.fdopen(r_fd, "r")
-        fake_proc.pid = 99996
-        fake_proc.poll.return_value = 0
-
-        with tempfile.TemporaryDirectory() as tmpdir, \
-             unittest.mock.patch("subprocess.Popen", return_value=fake_proc), \
-             unittest.mock.patch("os.sched_setaffinity"):
-            runner = YCruncherRunner(base_work_dir=tmpdir)
-            req = TestRequest(cpus=[0], target_iterations=1, graceful=True)
-            listener = DummyListener()
-            res = runner.run_test(req, listener=listener)
-
-            self.assertFalse(res.passed)
-            self.assertEqual(res.status, "ACTIVE_ERROR")
-            self.assertGreater(len(res.active_errors), 0)
-
-    def test_orchestrator_runner_cycling(self):
-        from unittest.mock import MagicMock
-        from lib.models import PhysicalCore, RunResult
-        from lib.orchestrator import ZenTunerOrchestrator
-
-        cores = [
-            PhysicalCore(core_idx=0, hardware_core_id=0, ccd_id=0, logical_cpus=[0, 12]),
-        ]
-
-        r1_calls = []
-        r2_calls = []
-
-        class MockR1(Prime95Runner):
-            def __init__(self):
-                pass
-            @property
-            def name(self):
-                return "prime95"
-            def run_test(self, req, listener=None):
-                r1_calls.append(req.cpus)
-                return RunResult(passed=True, status="PASS", tested_cpus=req.cpus, completed_tests=1, elapsed_seconds=1.0)
-
-        class MockR2(YCruncherRunner):
-            def __init__(self):
-                pass
-            @property
-            def name(self):
-                return "y-cruncher"
-            def run_test(self, req, listener=None):
-                r2_calls.append(req.cpus)
-                return RunResult(passed=True, status="PASS", tested_cpus=req.cpus, completed_tests=1, elapsed_seconds=1.0)
-
-        r1 = MockR1()
-        r2 = MockR2()
-        presenter = MagicMock()
-
-        orchestrator = ZenTunerOrchestrator(
-            runner={"prime95": r1, "y-cruncher": r2},
-            all_cores=cores,
-            presenter=presenter,
-            runner_mode="cycle",
-        )
-
-        stats = orchestrator.run(
-            selected_cores=cores,
-            duration_per_core=1.0,
-            cycles=2,
-            runner_parameters={"prime95": {"fft": "small"}, "y-cruncher": {"algorithms": ["BBP"]}},
-        )
-
-        self.assertEqual(stats[0].passes, 2)
-        # Cycle 1 ran MockR1 (prime95), Cycle 2 ran MockR2 (y-cruncher)
-        self.assertEqual(len(r1_calls), 1)
-        self.assertEqual(len(r2_calls), 1)
-
-
+        print("affinity", sorted(os.sched_getaffinity(0)))
+        print("own_group", os.getpgid(0) == os.getpid())
+        print("Self-test 4K passed!")
+    """
+    before = os.sched_getaffinity(0)
+    result = run(scripted(Prime95Runner, script), PRIME95_PARAMS, listener)
+    assert result.status == RunStatus.PASS
+    assert f"affinity {ONE_CPU}" in listener.lines
+    assert "own_group True" in listener.lines
+    assert os.sched_getaffinity(0) == before
+
+
+def test_hardware_errors_are_reported_without_failing(tmp_path, monkeypatch, listener):
+    fifo = tmp_path / "kmsg"
+    os.mkfifo(fifo)
+    monkeypatch.setattr("lib.monitors.KMSG_PATH", str(fifo))
+    record = f"0,1,2,-;mce: [Hardware Error]: CPU {ONE_CPU[0]}: Machine Check: 0 Bank 5: bea0000000000108"
+    script = f"""
+        import time
+        with open({str(fifo)!r}, "w") as kmsg:
+            kmsg.write({record!r} + "\\n")
+        time.sleep(0.3)
+        print("Self-test 4K passed!")
+    """
+    result = run(scripted(Prime95Runner, script), PRIME95_PARAMS, listener)
+    assert result.status == RunStatus.PASS
+    assert len(result.mce_events) == 1
+    assert result.mce_events[0].on_tested_cpu
+    assert listener.hardware_errors == result.mce_events
+
+
+def test_work_dir_kept_only_on_failure(tmp_path, no_kmsg, listener):
+    run(scripted(Prime95Runner, 'print("Self-test 4K passed!")', base_work_dir=str(tmp_path)), PRIME95_PARAMS, listener)
+    assert os.listdir(tmp_path) == []
+    run(scripted(Prime95Runner, 'print("FATAL ERROR: x")', base_work_dir=str(tmp_path)), PRIME95_PARAMS, listener)
+    assert len(os.listdir(tmp_path)) == 1
+
+
+def test_unavailable_binary():
+    runner = Prime95Runner(mprime_path="/nonexistent/mprime")
+    with pytest.raises(RunnerUnavailableError):
+        runner.run_test(TestRequest(cpus=ONE_CPU, parameters=PRIME95_PARAMS))

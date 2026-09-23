@@ -12,14 +12,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from lib.smu import RyzenSmuMonitor
-
-BOLD = "\033[1m"
-DIM = "\033[2m"
-CYAN = "\033[36m"
-YELLOW = "\033[33m"
-GREEN = "\033[32m"
-RED = "\033[31m"
-RESET = "\033[0m"
+from lib.ui import BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW
 
 
 def print_snapshot(snap) -> None:
@@ -66,7 +59,7 @@ def print_snapshot(snap) -> None:
         else:
             c0_col = GREEN if c.c0_pct > 50.0 else (YELLOW if c.c0_pct > 5.0 else RESET)
             c1_col = YELLOW if c.c1_pct > 50.0 else RESET
-            c6_col = "\033[2m" if c.c6_pct > 50.0 else RESET
+            c6_col = DIM if c.c6_pct > 50.0 else RESET
             co_str = f"{c.co_offset:+d}" if c.co_offset is not None else "--"
             v_str = f"{c.voltage_v:6.4f} V"
             p_str = f"{c.power_w:5.2f} W"
@@ -89,13 +82,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Inspect AMD Ryzen SMU PM table telemetry.")
     parser.add_argument("--loop", action="store_true", help="Continuously poll and display telemetry")
     parser.add_argument("--interval", type=float, default=1.0, help="Polling interval in seconds (default: 1.0)")
-    parser.add_argument("--cores", type=int, default=16, help="Maximum cores to display (default: 16)")
+    parser.add_argument("--cores", type=int, default=None, help="Number of enabled physical cores (default: auto-detect)")
     args = parser.parse_args()
 
-    with RyzenSmuMonitor() as mon:
-        if not mon.is_available():
+    with RyzenSmuMonitor(core_count=args.cores) as mon:
+        if not os.path.isfile(mon.pm_path):
             print(f"{BOLD}{RED}[ERROR] ryzen_smu kernel driver interface not found!{RESET}")
-            print("Path '/sys/kernel/ryzen_smu_drv/pm_table' is not accessible.")
+            print(f"Path '{mon.pm_path}' is not accessible.")
             print(f"{YELLOW}Hint: Ensure kernel module is loaded: sudo modprobe ryzen_smu{RESET}")
             sys.exit(1)
 
@@ -103,10 +96,13 @@ def main() -> None:
         if version is None:
             print(f"{RED}[ERROR] Failed to read pm_table_version from sysfs!{RESET}")
             sys.exit(1)
+        if not mon.is_available():
+            print(f"{RED}[ERROR] Unsupported PM table version 0x{version:06X}!{RESET}")
+            sys.exit(1)
 
         try:
             while True:
-                snap = mon.read_snapshot(max_cores=args.cores)
+                snap = mon.read_snapshot()
                 if not snap:
                     print(f"{RED}[ERROR] Failed to parse PM table buffer (version: 0x{version:06X})!{RESET}")
                     sys.exit(1)
