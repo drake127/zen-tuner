@@ -7,7 +7,7 @@ import abc
 import argparse
 import signal
 import subprocess
-from typing import Protocol
+from typing import Any, Protocol
 
 from lib.models import MceEvent, RunResult, StretchSample, TestRequest
 
@@ -57,6 +57,11 @@ class StressRunner(abc.ABC):
         """Registers runner-specific CLI parameters into an argparse argument parser."""
         ...
 
+    @classmethod
+    def parse_parameters(cls, args: argparse.Namespace) -> tuple[dict[str, Any], str]:
+        """Parses runner parameters from CLI args, returning (runner_parameters_dict, profile_desc_str)."""
+        return {}, cls.__name__
+
     @abc.abstractmethod
     def run_test(
         self,
@@ -80,6 +85,21 @@ def parse_time(time_str: str) -> float:
     if time_str.endswith("h"):
         return float(time_str[:-1]) * 3600.0
     return float(time_str)
+
+
+def parse_step_time(val: str | int | float | None, default_seconds: float = 60.0) -> float:
+    """Parses step duration (e.g. '1m', '60s', '30s', or int/float) into seconds as float."""
+    if val is None:
+        return default_seconds
+    s = str(val).strip().lower()
+    if s.endswith("s"):
+        return float(s[:-1])
+    if s.endswith("m"):
+        return float(s[:-1]) * 60.0
+    if s.endswith("h"):
+        return float(s[:-1]) * 3600.0
+    num = float(s)
+    return num * 60.0 if num <= 10 else num
 
 
 def terminate_process(proc: subprocess.Popen, graceful: bool = True) -> None:

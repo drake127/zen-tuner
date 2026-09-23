@@ -15,12 +15,15 @@ import select
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
+from typing import Any
 
+from lib.cpu import detect_cpu_instruction_sets, get_default_instruction_set
 from lib.models import MceEvent, RunResult, TestRequest
 from lib.monitors import CycleStretchingMonitor, KernelErrorMonitor
-from runners.base import StressRunner, TestEventListener, terminate_process
+from runners.base import StressRunner, TestEventListener, parse_step_time, terminate_process
 
 
 @dataclass(frozen=True)
@@ -82,7 +85,7 @@ def build_fft_config(
     mode: str = "avx2",
 ) -> FFTConfig:
     """Builds an FFTConfig from a preset alias, range string, or explicit bounds."""
-    if min_fft is not None or max_fft is not None or memory is not None:
+    if min_fft is not None or max_fft is not None:
         effective_min = min_fft if min_fft is not None else 4
         effective_max = max_fft if max_fft is not None else 4
         effective_mem = memory if memory is not None else 0
@@ -93,17 +96,20 @@ def build_fft_config(
     if match:
         rmin = int(match.group(1))
         rmax = int(match.group(2))
-        return FFTConfig(rmin, rmax, 0, f"Range {rmin}K-{rmax}K (in-place)")
+        effective_mem = memory if memory is not None else 0
+        return FFTConfig(rmin, rmax, effective_mem, f"Range {rmin}K-{rmax}K (Mem: {effective_mem}MB)")
 
     preset = preset_or_range.lower()
     mode_key = (mode or "avx2").lower()
     if preset in FFT_PRESET_MATRIX:
         mode_matrix = FFT_PRESET_MATRIX[preset]
-        if mode_key in mode_matrix:
-            return mode_matrix[mode_key]
-        return mode_matrix.get("avx2", mode_matrix["sse"])
+        base_cfg = mode_matrix.get(mode_key, mode_matrix.get("avx2", mode_matrix["sse"]))
+    else:
+        base_cfg = FFT_PRESET_MATRIX["smallest"].get(mode_key, FFT_PRESET_MATRIX["smallest"]["sse"])
 
-    return FFT_PRESET_MATRIX["smallest"].get(mode_key, FFT_PRESET_MATRIX["smallest"]["sse"])
+    if memory is not None and memory > 0:
+        return FFTConfig(base_cfg.min_fft, base_cfg.max_fft, memory, f"{base_cfg.desc} (Mem: {memory}MB)")
+    return base_cfg
 
 
 PASSED_PATTERN = re.compile(
@@ -132,7 +138,7 @@ class Prime95Runner(StressRunner):
 
     def __init__(self, mprime_path: str | None = None, base_work_dir: str | None = None):
         self.mprime_bin = self._resolve_mprime_bin(mprime_path)
-        self.base_work_dir = base_work_dir or os.path.join(tempfile.gettempdir(), "zen_tuner_runs")
+        self.base_work_dir = base_work_dir or os.path.join(tempfile.gettempdir(), f"zen_tuner_runs_{os.getuid()}")
         os.makedirs(self.base_work_dir, exist_ok=True)
 
     @property
@@ -158,24 +164,86 @@ class Prime95Runner(StressRunner):
         """Registers Prime95 specific CLI arguments."""
         group = parser.add_argument_group("Prime95 Specific Options")
         group.add_argument(
-            "--fft",
+            "--prime-fft",
             type=str,
             default="smallest",
-            help="FFT preset ('smallest', 'small', 'large', 'blend') or range (e.g. '36-248', default: 'smallest')",
+            help="Prime95 FFT preset ('smallest', 'small', 'large', 'blend') or range (e.g. '36-248') (default: 'smallest')",
         )
-        group.add_argument("--min-fft", type=int, default=None, help="Custom minimum FFT size in K")
-        group.add_argument("--max-fft", type=int, default=None, help="Custom maximum FFT size in K")
-        group.add_argument("--memory", type=int, default=None, help="Memory in MB for torture test (0 = in-place)")
-        group.add_argument("--test-time", type=int, default=1, help="Prime95 TortureTime in minutes (default: 1)")
-        group.add_argument("--mprime", type=str, default=None, help="Path to mprime binary")
-
         group.add_argument(
-            "--mode",
+            "--prime-min-fft",
+            type=int,
+            default=None,
+            help="Custom minimum FFT size in K (default: auto from preset)",
+        )
+        group.add_argument(
+            "--prime-max-fft",
+            type=int,
+            default=None,
+            help="Custom maximum FFT size in K (default: auto from preset)",
+        )
+        group.add_argument(
+            "--prime-memory",
+            type=int,
+            default=0,
+            help="Memory allocation in MB for Prime95 (0 = in-place FFTs) (default: 0)",
+        )
+        group.add_argument(
+            "--prime-test-time",
+            type=str,
+            default="1m",
+            help="Duration per Prime95 FFT step (e.g. '1m', '2m', '30s') (default: '1m')",
+        )
+        group.add_argument(
+            "--prime-mode",
             type=str.lower,
             choices=["sse", "avx", "avx2", "avx512"],
             default=None,
-            help="Instruction set mode: 'sse', 'avx', 'avx2', 'avx512' (default: auto)",
+            help="Prime95 instruction set mode: 'sse', 'avx', 'avx2', 'avx512' (default: auto)",
         )
+
+    @classmethod
+    def parse_parameters(cls, args: argparse.Namespace) -> tuple[dict[str, Any], str]:
+        """Parses Prime95 CLI arguments into runner parameters and profile description."""
+        supported_modes = detect_cpu_instruction_sets()
+        default_mode = get_default_instruction_set(supported_modes)
+        req_mode = getattr(args, "prime_mode", None) or getattr(args, "mode", None)
+        if req_mode:
+            mode_val = req_mode.lower()
+            if mode_val not in supported_modes:
+                print(
+                    f"[WARNING] Requested instruction mode '{mode_val}' is not supported by CPU "
+                    f"(supported: {sorted(supported_modes)}).",
+                    file=sys.stderr,
+                )
+        else:
+            mode_val = default_mode
+
+        fft_preset = getattr(args, "prime_fft", None) or getattr(args, "fft", "smallest")
+        min_fft = getattr(args, "prime_min_fft", None)
+        if min_fft is None:
+            min_fft = getattr(args, "min_fft", None)
+        max_fft = getattr(args, "prime_max_fft", None)
+        if max_fft is None:
+            max_fft = getattr(args, "max_fft", None)
+        memory = getattr(args, "prime_memory", None)
+        if memory is None:
+            memory = getattr(args, "memory", 0)
+
+        fft_cfg = build_fft_config(fft_preset, min_fft, max_fft, memory, mode=mode_val)
+        profile_desc = f"{fft_cfg.desc} [{mode_val.upper()}]"
+
+        test_time_val = getattr(args, "prime_test_time", None) or getattr(args, "test_time", "1m")
+        sec = parse_step_time(test_time_val, default_seconds=60.0)
+        test_time_min = max(1, int(round(sec / 60.0)))
+
+        runner_params = {
+            "fft_preset": fft_preset,
+            "fft_config": fft_cfg,
+            "custom_fft": fft_cfg,
+            "test_time_min": test_time_min,
+            "mode": mode_val,
+        }
+        return runner_params, profile_desc
 
     def write_config(
         self,

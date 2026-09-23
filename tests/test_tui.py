@@ -428,6 +428,38 @@ class TestTui(unittest.TestCase):
         presenter.close()
 
 
+    def test_summary_table_displays_all_cores_co(self):
+        from unittest.mock import MagicMock
+        from lib.ui import strip_ansi
+
+        cores = [
+            PhysicalCore(0, 0, 0, [0, 12]),
+            PhysicalCore(1, 1, 0, [1, 13]),
+        ]
+        smu_mock = MagicMock()
+        smu_mock.is_available.return_value = True
+        smu_mock.read_all_co_offsets.return_value = {0: -20, 1: -15}
+
+        presenter = CursesPresenter(all_cores=cores, duration_per_core=30.0, smu_monitor=smu_mock)
+        # Verify stats received CO offsets upon initialization
+        self.assertEqual(presenter.stats[0].co_offset, -20)
+        self.assertEqual(presenter.stats[1].co_offset, -15)
+
+        # Core 0 ran and passed, Core 1 never ran (SKIPPED / not yet run)
+        presenter.stats[0].passes = 1
+        logged = []
+        presenter.logger = MagicMock()
+        presenter.logger.log = lambda t: logged.append(t)
+
+        presenter.print_summary_table(cores, presenter.stats)
+        table_output = strip_ansi("\n".join(logged))
+
+        # Both cores should display their CO offsets in the table
+        self.assertIn("-20", table_output)
+        self.assertIn("-15", table_output)
+        self.assertIn("SKIPPED", table_output)
+
+
 if __name__ == "__main__":
     unittest.main()
 

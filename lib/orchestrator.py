@@ -20,7 +20,7 @@ class PresenterProtocol(TestEventListener, Protocol):
     def print_banner(self, **kwargs) -> None:
         ...
 
-    def print_cycle_start(self, cycle_num: int, total_cycles: int) -> None:
+    def print_cycle_start(self, cycle_num: int, total_cycles: int, runner_name: str | None = None) -> None:
         ...
 
     def print_core_start(self, cycle_num: int, core: PhysicalCore, ht_label: str) -> None:
@@ -38,13 +38,15 @@ class ZenTunerOrchestrator:
 
     def __init__(
         self,
-        runner: StressRunner,
+        runner: StressRunner | dict[str, StressRunner],
         all_cores: list[PhysicalCore],
         presenter: PresenterProtocol | Any | None = None,
+        runner_mode: str = "single",
     ):
         self.runner = runner
         self.all_cores = all_cores
         self.presenter = presenter
+        self.runner_mode = runner_mode
         self.cpu_to_core_map = {cpu: core for core in all_cores for cpu in core.logical_cpus}
         self.stats: dict[int, CoreStats] = {c.core_idx: CoreStats() for c in all_cores}
         if self.presenter and hasattr(self.presenter, "stats"):
@@ -73,7 +75,6 @@ class ZenTunerOrchestrator:
         Executes stress testing across selected cores for the configured number of cycles.
         Returns accumulated stats mapping core index to CoreStats.
         """
-        params = runner_parameters or {}
         old_sigint = signal.signal(signal.SIGINT, self._sigint_handler)
         cycle_num = 1
 
@@ -86,8 +87,21 @@ class ZenTunerOrchestrator:
                         self.presenter._write("\n[!] All selected cores have failed. Stopping cycle runs.")
                     break
 
+                # Resolve active runner and parameters for this cycle
+                if self.runner_mode == "cycle" and isinstance(self.runner, dict):
+                    engine_name = "prime95" if (cycle_num % 2 == 1) else "y-cruncher"
+                    active_runner = self.runner.get(engine_name, list(self.runner.values())[0])
+                    cyc_params = runner_parameters.get(engine_name) if runner_parameters else None
+                    params = cyc_params if isinstance(cyc_params, dict) else (runner_parameters or {})
+                else:
+                    active_runner = self.runner if isinstance(self.runner, StressRunner) else list(self.runner.values())[0]
+                    params = runner_parameters or {}
+
                 if self.presenter and hasattr(self.presenter, "print_cycle_start"):
-                    self.presenter.print_cycle_start(cycle_num, cycles)
+                    try:
+                        self.presenter.print_cycle_start(cycle_num, cycles, runner_name=active_runner.name)
+                    except TypeError:
+                        self.presenter.print_cycle_start(cycle_num, cycles)
 
                 for core in selected_cores:
                     if self.interrupted:
@@ -117,7 +131,7 @@ class ZenTunerOrchestrator:
                         parameters=core_params,
                     )
 
-                    result: RunResult = self.runner.run_test(request, listener=self.presenter)
+                    result: RunResult = active_runner.run_test(request, listener=self.presenter)
                     if self.interrupted or result.status == "INTERRUPTED":
                         result.status = "INTERRUPTED"
                         result.passed = False

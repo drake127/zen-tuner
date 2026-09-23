@@ -46,6 +46,17 @@ class CursesPresenter(TestEventListener):
         self.refresh_interval = max(0.1, refresh_interval)
         self.stats: dict[int, CoreStats] = stats if stats is not None else {c.core_idx: CoreStats() for c in all_cores}
 
+        if self.smu_monitor and self.smu_monitor.is_available():
+            try:
+                co_offsets = self.smu_monitor.read_all_co_offsets(16)
+                if co_offsets:
+                    for c in all_cores:
+                        val = co_offsets.get(c.hardware_core_id, co_offsets.get(c.core_idx))
+                        if val is not None and self.stats[c.core_idx].co_offset is None:
+                            self.stats[c.core_idx].co_offset = val
+            except Exception:
+                pass
+
         self.log_lines: deque[tuple[str, int]] = deque(maxlen=2000)
         self.cycle_num = 1
         self.total_cycles = 1
@@ -232,11 +243,12 @@ class CursesPresenter(TestEventListener):
         self.profile_info = kwargs.get("profile_info")
         self.start()
 
-    def print_cycle_start(self, cycle_num: int, total_cycles: int) -> None:
+    def print_cycle_start(self, cycle_num: int, total_cycles: int, runner_name: str | None = None) -> None:
         self.cycle_num = cycle_num
         self.total_cycles = total_cycles
         tot_str = f" of {total_cycles}" if total_cycles > 0 else ""
-        self._add_log(f"▶ Starting Cycle {cycle_num}{tot_str}", self.COLOR_HEADER)
+        runner_str = f" [{runner_name}]" if runner_name else ""
+        self._add_log(f"▶ Starting Cycle {cycle_num}{tot_str}{runner_str}", self.COLOR_HEADER)
 
     def print_core_start(self, cycle_num: int, core: PhysicalCore, ht_label: str) -> None:
         self.current_core = core
@@ -333,7 +345,22 @@ class CursesPresenter(TestEventListener):
                 ccd_hdr = f" {MAGENTA}{BOLD}── {ccd_str} {'─' * (box_w - len(ccd_str) - 5)}{RESET}"
                 _out(f"║{ccd_hdr}║")
 
-            co_str = f"{st.co_offset:+d}" if st.co_offset is not None else "--"
+            co_val = st.co_offset
+            if co_val is None and self.smu_monitor and self.smu_monitor.is_available():
+                try:
+                    co_offsets = self.smu_monitor.read_all_co_offsets(16)
+                    co_val = co_offsets.get(core.hardware_core_id, co_offsets.get(core.core_idx))
+                    if co_val is not None:
+                        st.co_offset = co_val
+                except Exception:
+                    pass
+            elif co_val is None and self.last_smu_snapshot:
+                sm = self.last_smu_snapshot.cores.get(core.core_idx)
+                if sm and sm.co_offset is not None:
+                    co_val = sm.co_offset
+                    st.co_offset = co_val
+
+            co_str = f"{co_val:+d}" if co_val is not None else "--"
             volt_str = f"{st.avg_voltage_v:.4f}V" if st.avg_voltage_v is not None else "--"
             power_str = f"{st.avg_power_w:.2f}W" if st.avg_power_w is not None else "--"
             temp_str = f"{st.avg_temp_c:.0f}°C" if st.avg_temp_c is not None else "--"
