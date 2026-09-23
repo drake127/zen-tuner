@@ -259,6 +259,60 @@ class TestOrchestrator(unittest.TestCase):
         self.assertEqual(stats[0].failures, 1)
         self.assertEqual(stats[1].failures, 1)
 
+    def test_orchestrator_accumulate_stats_stretch_below_50_not_flagged(self):
+        orch = ZenTunerOrchestrator(runner=MockRunner(), all_cores=self.cores)
+        res = RunResult(
+            passed=True,
+            status="PASS",
+            tested_cpus=[0, 12],
+            completed_tests=1,
+            elapsed_seconds=10.0,
+            median_stretch_mhz=19.0,
+            avg_stretch_mhz=19.0,
+            avg_target_mhz=4850.0,
+            avg_effective_mhz=4831.0,
+        )
+        orch._accumulate_stats(0, res)
+        self.assertFalse(orch.stats[0].stretching_detected)
+        self.assertEqual(orch.stats[0].median_stretch_mhz, 19.0)
+
+    def test_orchestrator_accumulate_stats_stretch_above_50_flagged(self):
+        orch = ZenTunerOrchestrator(runner=MockRunner(), all_cores=self.cores)
+        res = RunResult(
+            passed=True,
+            status="PASS",
+            tested_cpus=[0, 12],
+            completed_tests=1,
+            elapsed_seconds=10.0,
+            median_stretch_mhz=75.0,
+            avg_stretch_mhz=75.0,
+            avg_target_mhz=4850.0,
+            avg_effective_mhz=4775.0,
+        )
+        orch._accumulate_stats(0, res)
+        self.assertTrue(orch.stats[0].stretching_detected)
+        self.assertEqual(orch.stats[0].median_stretch_mhz, 75.0)
+
+    def test_orchestrator_accumulate_stats_multiple_cycles_max_median(self):
+        orch = ZenTunerOrchestrator(runner=MockRunner(), all_cores=self.cores)
+        res1 = RunResult(
+            passed=True, status="PASS", tested_cpus=[0, 12], completed_tests=1,
+            elapsed_seconds=10.0, median_stretch_mhz=0.0, avg_stretch_mhz=0.0,
+            avg_target_mhz=4850.0, avg_effective_mhz=4850.0,
+        )
+        orch._accumulate_stats(0, res1)
+        self.assertFalse(orch.stats[0].stretching_detected)
+        self.assertEqual(orch.stats[0].median_stretch_mhz, 0.0)
+
+        res2 = RunResult(
+            passed=True, status="PASS", tested_cpus=[0, 12], completed_tests=1,
+            elapsed_seconds=10.0, median_stretch_mhz=85.0, avg_stretch_mhz=85.0,
+            avg_target_mhz=4850.0, avg_effective_mhz=4765.0,
+        )
+        orch._accumulate_stats(0, res2)
+        self.assertTrue(orch.stats[0].stretching_detected)
+        self.assertEqual(orch.stats[0].median_stretch_mhz, 85.0)
+
 
 if __name__ == "__main__":
     unittest.main()

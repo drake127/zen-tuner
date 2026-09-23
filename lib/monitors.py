@@ -8,6 +8,7 @@ import errno
 import os
 import re
 import select
+import statistics
 import struct
 import time
 
@@ -20,7 +21,7 @@ MSR_IA32_APERF = 0xE8
 
 # Clock stretching detection threshold in MHz.
 # A drop below the target frequency exceeding this value is flagged as stretching.
-STRETCH_THRESHOLD_MHZ: float = 100.0
+STRETCH_THRESHOLD_MHZ: float = 50.0
 
 MCE_CPU_PATTERNS = [
     re.compile(r"\[Hardware Error\]:\s+CPU\s+(\d+):", re.IGNORECASE),
@@ -82,8 +83,22 @@ class CycleStretchingMonitor:
 
     @property
     def avg_stretch_mhz(self) -> float:
-        """Average clock stretch in MHz across all qualifying samples (busy >= 95%)."""
+        """Average clock stretch in MHz across all qualifying workload samples (busy >= 95%)."""
+        if self.all_samples:
+            return sum(s.stretch_mhz for s in self.all_samples) / len(self.all_samples)
         return self._stretch_sum / self._stretch_count if self._stretch_count > 0 else 0.0
+
+    @property
+    def median_stretch_mhz(self) -> float:
+        """Median clock stretch in MHz across all qualifying workload samples (busy >= 95%)."""
+        if not self.all_samples:
+            return 0.0
+        return float(statistics.median(s.stretch_mhz for s in self.all_samples))
+
+    @property
+    def stretching_detected(self) -> bool:
+        """True if median clock stretching meets or exceeds threshold_mhz."""
+        return self.median_stretch_mhz >= self.threshold_mhz
 
     def __enter__(self) -> "CycleStretchingMonitor":
         return self
@@ -185,9 +200,8 @@ class CycleStretchingMonitor:
                             stretch_pct=stretch_pct,
                         )
                         self.all_samples.append(sample)
-                        if stretch_mhz > 0:
-                            self._stretch_sum += stretch_mhz
-                            self._stretch_count += 1
+                        self._stretch_sum += stretch_mhz
+                        self._stretch_count += 1
                         if stretch_mhz > self.max_stretch_mhz:
                             self.max_stretch_mhz = stretch_mhz
                         if stretch_mhz >= self.threshold_mhz:
@@ -236,9 +250,8 @@ class CycleStretchingMonitor:
                     stretch_pct=stretch_pct,
                 )
                 self.all_samples.append(sample)
-                if stretch_mhz > 0:
-                    self._stretch_sum += stretch_mhz
-                    self._stretch_count += 1
+                self._stretch_sum += stretch_mhz
+                self._stretch_count += 1
                 if stretch_mhz > self.max_stretch_mhz:
                     self.max_stretch_mhz = stretch_mhz
 

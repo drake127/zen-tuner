@@ -32,6 +32,7 @@ class CoreStats:
     avg_effective_mhz: float | None = None
     max_stretch_mhz: float = 0.0
     avg_stretch_mhz: float = 0.0
+    median_stretch_mhz: float = 0.0
     stretching_detected: bool = False
     co_offset: int | None = None
     # SMU snapshot metrics captured at end of each test (for results table)
@@ -74,6 +75,7 @@ class RunResult:
     stretching_detected: bool = False
     max_stretch_mhz: float = 0.0
     avg_stretch_mhz: float = 0.0
+    median_stretch_mhz: float = 0.0
     avg_target_mhz: float | None = None
     avg_effective_mhz: float | None = None
     stretch_samples_count: int = 0

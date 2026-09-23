@@ -477,7 +477,7 @@ class YCruncherRunner(StressRunner):
                 avg_target = sum(s.target_mhz for s in stretch_mon.all_samples) / len(stretch_mon.all_samples)
                 avg_effective = sum(s.effective_mhz for s in stretch_mon.all_samples) / len(stretch_mon.all_samples)
 
-            stretching_detected = stretch_mon.stretch_alerts_count > 0
+            stretching_detected = stretch_mon.stretching_detected
 
             if was_interrupted:
                 status = "INTERRUPTED"
@@ -517,6 +517,7 @@ class YCruncherRunner(StressRunner):
                 stretching_detected=stretching_detected,
                 max_stretch_mhz=stretch_mon.max_stretch_mhz,
                 avg_stretch_mhz=stretch_mon.avg_stretch_mhz,
+                median_stretch_mhz=stretch_mon.median_stretch_mhz,
                 avg_target_mhz=avg_target,
                 avg_effective_mhz=avg_effective,
                 stretch_samples_count=stretch_mon.stretch_alerts_count,

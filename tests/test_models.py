@@ -29,6 +29,7 @@ class TestModels(unittest.TestCase):
         self.assertEqual(stats.passes, 0)
         self.assertEqual(stats.failures, 0)
         self.assertFalse(stats.stretching_detected)
+        self.assertEqual(stats.median_stretch_mhz, 0.0)
 
     def test_run_result_attributes(self):
         res = RunResult(
@@ -41,6 +42,7 @@ class TestModels(unittest.TestCase):
         self.assertTrue(res.passed)
         self.assertEqual(res.status, "PASS")
         self.assertEqual(res.completed_tests, 1)
+        self.assertEqual(res.median_stretch_mhz, 0.0)
 
     def test_test_request(self):
         req = TestRequest(cpus=[0, 12], duration_seconds=60.0)

@@ -160,6 +160,51 @@ class TestMonitors(unittest.TestCase):
             tgt = mon._get_target_freq_mhz(0, sysfs_root=tmpdir)
             self.assertEqual(tgt, 4950.0)
 
+    def test_stretching_monitor_default_threshold_is_50(self):
+        mon = CycleStretchingMonitor(cpus=[0])
+        self.assertEqual(mon.threshold_mhz, 50.0)
+
+    def test_stretching_monitor_median_filters_transient_spikes(self):
+        from lib.models import StretchSample
+        mon = CycleStretchingMonitor(cpus=[0], threshold_mhz=50.0)
+        # 59 normal samples (effective == target, 0 stretch)
+        for _ in range(59):
+            mon.all_samples.append(
+                StretchSample(cpu=0, target_mhz=4850.0, effective_mhz=4849.0, stretch_mhz=0.0, stretch_pct=0.0)
+            )
+        # 1 transient drop of 19 MHz
+        mon.all_samples.append(
+            StretchSample(cpu=0, target_mhz=4850.0, effective_mhz=4831.0, stretch_mhz=19.0, stretch_pct=0.4)
+        )
+        self.assertEqual(mon.median_stretch_mhz, 0.0)
+        self.assertFalse(mon.stretching_detected)
+        self.assertAlmostEqual(mon.avg_stretch_mhz, 19.0 / 60.0, places=2)
+
+    def test_stretching_monitor_median_detects_persistent_stretching(self):
+        from lib.models import StretchSample
+        mon = CycleStretchingMonitor(cpus=[0], threshold_mhz=50.0)
+        for _ in range(60):
+            mon.all_samples.append(
+                StretchSample(cpu=0, target_mhz=4850.0, effective_mhz=4730.0, stretch_mhz=120.0, stretch_pct=2.5)
+            )
+        self.assertEqual(mon.median_stretch_mhz, 120.0)
+        self.assertTrue(mon.stretching_detected)
+
+    def test_stretching_monitor_transient_spike_above_50_does_not_flag_stretching(self):
+        from lib.models import StretchSample
+        mon = CycleStretchingMonitor(cpus=[0], threshold_mhz=50.0)
+        for _ in range(58):
+            mon.all_samples.append(
+                StretchSample(cpu=0, target_mhz=4850.0, effective_mhz=4850.0, stretch_mhz=0.0, stretch_pct=0.0)
+            )
+        # 2 samples of 80 MHz drop (e.g. FFT size switch)
+        for _ in range(2):
+            mon.all_samples.append(
+                StretchSample(cpu=0, target_mhz=4850.0, effective_mhz=4770.0, stretch_mhz=80.0, stretch_pct=1.6)
+            )
+        self.assertEqual(mon.median_stretch_mhz, 0.0)
+        self.assertFalse(mon.stretching_detected)
+
 
 if __name__ == "__main__":
     unittest.main()

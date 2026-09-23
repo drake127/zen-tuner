@@ -425,6 +425,23 @@ class TestTui(unittest.TestCase):
         self.assertNotIn("-2M", rendered_noise)
         self.assertIn("0M", rendered_noise)
 
+        # Test 19 MHz drop (below 50 MHz threshold) - must NOT show -19M, must show 0M
+        slot_19 = CoreSmuMetrics(
+            core_idx=0, slot_idx=0, ccd_idx=0, is_enabled=True,
+            voltage_v=1.35, power_w=15.0, temp_c=65.0,
+            frequency_mhz=4850.0, effective_mhz=4831.0,
+            c0_pct=99.0, c1_pct=1.0, c6_pct=0.0,
+        )
+        presenter.last_smu_snapshot = SmuSnapshot(
+            cores={0: slot_19}, package=PackageSmuMetrics(0, 0, 0, 0, 0, 0, 0, 0),
+            pm_version=0x380805, slots=[slot_19],
+        )
+        calls.clear()
+        presenter._draw_cores_pane(top=0, left=0, height=20, width=100)
+        rendered_19 = "\n".join(calls)
+        self.assertNotIn("-19M", rendered_19)
+        self.assertIn("0M", rendered_19)
+
         presenter.close()
 
 
@@ -458,6 +475,60 @@ class TestTui(unittest.TestCase):
         self.assertIn("-20", table_output)
         self.assertIn("-15", table_output)
         self.assertIn("SKIPPED", table_output)
+
+    def test_summary_table_clock_stretching_50mhz_threshold(self):
+        from unittest.mock import MagicMock
+        from lib.ui import strip_ansi
+
+        cores = [
+            PhysicalCore(0, 0, 0, [0, 12]),
+            PhysicalCore(1, 1, 0, [1, 13]),
+            PhysicalCore(2, 2, 0, [2, 14]),
+        ]
+        presenter = CursesPresenter(all_cores=cores, duration_per_core=30.0)
+        # Core 0: transient 19 MHz drop, 1 MHz target/eff diff -> should show 0M and PASS
+        st0 = presenter.stats[0]
+        st0.passes = 1
+        st0.avg_target_mhz = 4850.0
+        st0.avg_effective_mhz = 4849.0
+        st0.max_stretch_mhz = 19.0
+        st0.median_stretch_mhz = 0.0
+        st0.avg_stretch_mhz = 0.3
+
+        # Core 1: 42 MHz drop (below 50 MHz threshold) -> should show 0M and PASS
+        st1 = presenter.stats[1]
+        st1.passes = 1
+        st1.avg_target_mhz = 4834.0
+        st1.avg_effective_mhz = 4792.0
+        st1.max_stretch_mhz = 42.0
+        st1.median_stretch_mhz = 42.0
+        st1.avg_stretch_mhz = 42.0
+
+        # Core 2: 150 MHz persistent drop (>= 50 MHz) -> should show -150M and PASS (STRETCH)
+        st2 = presenter.stats[2]
+        st2.passes = 1
+        st2.avg_target_mhz = 4850.0
+        st2.avg_effective_mhz = 4700.0
+        st2.max_stretch_mhz = 150.0
+        st2.median_stretch_mhz = 150.0
+        st2.stretching_detected = True
+
+        logged = []
+        presenter.logger = MagicMock()
+        presenter.logger.log = lambda t: logged.append(t)
+        presenter.print_summary_table(cores, presenter.stats)
+        table_output = strip_ansi("\n".join(logged))
+
+        # Core 0: Eff 4849, Tgt 4850, Drop 0M, Status PASS
+        self.assertIn("4849", table_output)
+        self.assertNotIn("-19M", table_output)
+
+        # Core 1: Drop 0M, Status PASS
+        self.assertNotIn("-42M", table_output)
+
+        # Core 2: Drop -150M, Status PASS (STRETCH)
+        self.assertIn("-150M", table_output)
+        self.assertIn("PASS (STRETCH)", table_output)
 
 
 if __name__ == "__main__":

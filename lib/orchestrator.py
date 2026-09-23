@@ -215,19 +215,23 @@ class ZenTunerOrchestrator:
         if result.stretching_detected:
             st.stretching_detected = True
 
-        # Running average of avg_stretch_mhz across cycles (weighted by cycle count)
-        calc_stretch = result.avg_stretch_mhz
-        if calc_stretch <= 0 and result.avg_target_mhz and result.avg_effective_mhz:
-            diff = result.avg_target_mhz - result.avg_effective_mhz
-            if diff > 5.0:
-                calc_stretch = diff
+        # Running average and maximum median stretch across cycles
+        calc_median = result.median_stretch_mhz if result.median_stretch_mhz > 0 else result.avg_stretch_mhz
+        prev_cycles = st.passes + st.failures
+        if prev_cycles == 0:
+            st.avg_stretch_mhz = result.avg_stretch_mhz
+            st.median_stretch_mhz = calc_median
+        else:
+            st.avg_stretch_mhz = (st.avg_stretch_mhz * prev_cycles + result.avg_stretch_mhz) / (prev_cycles + 1)
+            st.median_stretch_mhz = max(st.median_stretch_mhz, calc_median)
 
-        if calc_stretch > 0:
-            prev_cycles = st.passes + st.failures
-            if prev_cycles == 0:
-                st.avg_stretch_mhz = calc_stretch
-            else:
-                st.avg_stretch_mhz = (st.avg_stretch_mhz * prev_cycles + calc_stretch) / (prev_cycles + 1)
+        if st.median_stretch_mhz <= 0 and st.avg_target_mhz and st.avg_effective_mhz:
+            diff = st.avg_target_mhz - st.avg_effective_mhz
+            if diff >= 50.0:
+                st.median_stretch_mhz = diff
+
+        if st.median_stretch_mhz >= 50.0:
+            st.stretching_detected = True
 
         if result.passed:
             st.passes += 1
