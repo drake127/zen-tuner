@@ -379,6 +379,52 @@ class TestTui(unittest.TestCase):
         self.assertIn("*  1", table_output)
         self.assertIn("   2", table_output)
 
+    def test_tui_live_target_and_drop(self):
+        from lib.models import CoreSmuMetrics, PackageSmuMetrics, SmuSnapshot
+        cores = [PhysicalCore(0, 0, 0, [0, 12])]
+        presenter = CursesPresenter(all_cores=cores, duration_per_core=30.0)
+        presenter.current_core = cores[0]  # ACTIVE
+
+        slot = CoreSmuMetrics(
+            core_idx=0, slot_idx=0, ccd_idx=0, is_enabled=True,
+            voltage_v=1.35, power_w=15.0, temp_c=65.0,
+            frequency_mhz=4850.0, effective_mhz=4650.0,
+            c0_pct=99.0, c1_pct=1.0, c6_pct=0.0,
+        )
+        presenter.last_smu_snapshot = SmuSnapshot(
+            cores={0: slot}, package=PackageSmuMetrics(0, 0, 0, 0, 0, 0, 0, 0),
+            pm_version=0x380805, slots=[slot],
+        )
+
+        calls = []
+        presenter._safe_addstr = lambda y, x, text, attr=0: calls.append(text)
+        presenter._curses_active = True
+
+        # Render wide cores pane
+        presenter._draw_cores_pane(top=0, left=0, height=20, width=100)
+        rendered = "\n".join(calls)
+        # Should display Clock 4650, Target 4850, Drop -200M
+        self.assertIn("4650", rendered)
+        self.assertIn("4850", rendered)
+        self.assertIn("-200M", rendered)
+
+        # Now test noise (4848 vs 4850 MHz) - must NOT show -2M, must show 0M
+        slot_noise = CoreSmuMetrics(
+            core_idx=0, slot_idx=0, ccd_idx=0, is_enabled=True,
+            voltage_v=1.35, power_w=15.0, temp_c=65.0,
+            frequency_mhz=4850.0, effective_mhz=4848.0,
+            c0_pct=99.0, c1_pct=1.0, c6_pct=0.0,
+        )
+        presenter.last_smu_snapshot = SmuSnapshot(
+            cores={0: slot_noise}, package=PackageSmuMetrics(0, 0, 0, 0, 0, 0, 0, 0),
+            pm_version=0x380805, slots=[slot_noise],
+        )
+        calls.clear()
+        presenter._draw_cores_pane(top=0, left=0, height=20, width=100)
+        rendered_noise = "\n".join(calls)
+        self.assertNotIn("-2M", rendered_noise)
+        self.assertIn("0M", rendered_noise)
+
         presenter.close()
 
 

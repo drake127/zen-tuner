@@ -57,10 +57,19 @@ def calculate_clock_metrics(
 class CycleStretchingMonitor:
     """Monitors APERF/MPERF MSRs to detect AMD Ryzen cycle and clock stretching."""
 
-    def __init__(self, cpus: list[int], threshold_mhz: float = STRETCH_THRESHOLD_MHZ, sample_interval: float = 1.0):
+    def __init__(
+        self,
+        cpus: list[int],
+        threshold_mhz: float = STRETCH_THRESHOLD_MHZ,
+        sample_interval: float = 1.0,
+        smu_monitor: object | None = None,
+        core_idx: int | None = None,
+    ):
         self.cpus: list[int] = list(cpus)
         self.threshold_mhz: float = threshold_mhz
         self.sample_interval: float = sample_interval
+        self.smu_monitor = smu_monitor
+        self.core_idx = core_idx
         self.msr_fds: dict[int, int] = {}
         self.last_sample_time: float = 0.0
         self.prev_state: dict[int, dict[str, float]] = {}
@@ -106,13 +115,29 @@ class CycleStretchingMonitor:
             pass
         return None
 
-    def _get_target_freq_mhz(self, cpu: int) -> float | None:
-        for fname in ("scaling_cur_freq", "cpuinfo_cur_freq"):
-            path = f"/sys/devices/system/cpu/cpu{cpu}/cpufreq/{fname}"
+    def _get_target_freq_mhz(self, cpu: int, sysfs_root: str = "/sys") -> float | None:
+        driver_path = f"{sysfs_root}/devices/system/cpu/cpu{cpu}/cpufreq/scaling_driver"
+        is_amd_pstate = False
+        try:
+            if os.path.exists(driver_path):
+                with open(driver_path, "r", encoding="utf-8") as f:
+                    is_amd_pstate = "amd-pstate" in f.read().strip()
+        except OSError:
+            pass
+
+        if is_amd_pstate:
+            candidates = ("amd_pstate_max_freq", "scaling_max_freq", "cpuinfo_max_freq")
+        else:
+            candidates = ("scaling_cur_freq", "cpuinfo_cur_freq", "scaling_max_freq")
+
+        for fname in candidates:
+            path = f"{sysfs_root}/devices/system/cpu/cpu{cpu}/cpufreq/{fname}"
             if os.path.exists(path):
                 try:
                     with open(path, "r", encoding="utf-8") as f:
-                        return float(f.read().strip()) / 1000.0
+                        val = float(f.read().strip()) / 1000.0
+                        if val > 0:
+                            return val
                 except (OSError, ValueError):
                     pass
         return None
@@ -127,7 +152,7 @@ class CycleStretchingMonitor:
                 self.prev_state[cpu] = {"time": now, "aperf": aperf, "mperf": mperf, "tsc": tsc}
 
     def poll(self) -> list[StretchSample]:
-        """Polls MSRs and returns new samples where clock stretching was detected."""
+        """Polls hardware telemetry and returns new samples where clock stretching was detected."""
         now = time.perf_counter()
         dt = now - self.last_sample_time
         if dt < self.sample_interval:
@@ -135,6 +160,40 @@ class CycleStretchingMonitor:
 
         self.last_sample_time = now
         new_alerts: list[StretchSample] = []
+
+        if self.smu_monitor and hasattr(self.smu_monitor, "is_available") and self.smu_monitor.is_available():
+            if self.core_idx is not None and hasattr(self.smu_monitor, "read_snapshot"):
+                try:
+                    snap = self.smu_monitor.read_snapshot()
+                except Exception:
+                    snap = None
+
+                if snap and self.core_idx in snap.cores:
+                    sm = snap.cores[self.core_idx]
+                    if sm.is_enabled and sm.c0_pct >= 95.0 and sm.frequency_mhz >= 2500.0:
+                        target_mhz = sm.frequency_mhz
+                        effective_mhz = sm.effective_mhz
+                        raw_stretch = target_mhz - effective_mhz
+                        stretch_mhz = raw_stretch if raw_stretch > 5.0 else 0.0
+                        stretch_pct = (stretch_mhz / target_mhz) * 100.0 if target_mhz > 0 else 0.0
+
+                        sample = StretchSample(
+                            cpu=self.cpus[0] if self.cpus else self.core_idx,
+                            target_mhz=target_mhz,
+                            effective_mhz=effective_mhz,
+                            stretch_mhz=stretch_mhz,
+                            stretch_pct=stretch_pct,
+                        )
+                        self.all_samples.append(sample)
+                        if stretch_mhz > 0:
+                            self._stretch_sum += stretch_mhz
+                            self._stretch_count += 1
+                        if stretch_mhz > self.max_stretch_mhz:
+                            self.max_stretch_mhz = stretch_mhz
+                        if stretch_mhz >= self.threshold_mhz:
+                            self.stretch_alerts_count += 1
+                            new_alerts.append(sample)
+                    return new_alerts
 
         for cpu in self.cpus:
             if cpu not in self.prev_state:
@@ -163,10 +222,12 @@ class CycleStretchingMonitor:
             if metrics is None:
                 continue
 
-            _, busy_pct, effective_mhz, stretch_mhz, stretch_pct = metrics
+            _, busy_pct, effective_mhz, raw_stretch, raw_pct = metrics
 
             # Check stretching under active torture load (>= 95% busy, >= 2500 MHz target)
             if busy_pct >= 95.0 and target_mhz >= 2500.0:
+                stretch_mhz = raw_stretch if raw_stretch > 5.0 else 0.0
+                stretch_pct = (stretch_mhz / target_mhz) * 100.0 if target_mhz > 0 else 0.0
                 sample = StretchSample(
                     cpu=cpu,
                     target_mhz=target_mhz,
@@ -175,8 +236,9 @@ class CycleStretchingMonitor:
                     stretch_pct=stretch_pct,
                 )
                 self.all_samples.append(sample)
-                self._stretch_sum += stretch_mhz
-                self._stretch_count += 1
+                if stretch_mhz > 0:
+                    self._stretch_sum += stretch_mhz
+                    self._stretch_count += 1
                 if stretch_mhz > self.max_stretch_mhz:
                     self.max_stretch_mhz = stretch_mhz
 

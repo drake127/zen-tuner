@@ -104,12 +104,17 @@ class ZenTunerOrchestrator:
                     if self.presenter and hasattr(self.presenter, "print_core_start"):
                         self.presenter.print_core_start(cycle_num, core, ht_label)
 
+                    core_params = dict(params)
+                    core_params["core_idx"] = core.core_idx
+                    if self.presenter and hasattr(self.presenter, "smu_monitor"):
+                        core_params["smu_monitor"] = self.presenter.smu_monitor
+
                     request = TestRequest(
                         cpus=test_cpus,
                         duration_seconds=duration_per_core,
                         target_iterations=target_tests_per_core,
                         graceful=graceful,
-                        parameters=params,
+                        parameters=core_params,
                     )
 
                     result: RunResult = self.runner.run_test(request, listener=self.presenter)
@@ -197,12 +202,18 @@ class ZenTunerOrchestrator:
             st.stretching_detected = True
 
         # Running average of avg_stretch_mhz across cycles (weighted by cycle count)
-        if result.avg_stretch_mhz > 0:
+        calc_stretch = result.avg_stretch_mhz
+        if calc_stretch <= 0 and result.avg_target_mhz and result.avg_effective_mhz:
+            diff = result.avg_target_mhz - result.avg_effective_mhz
+            if diff > 5.0:
+                calc_stretch = diff
+
+        if calc_stretch > 0:
             prev_cycles = st.passes + st.failures
             if prev_cycles == 0:
-                st.avg_stretch_mhz = result.avg_stretch_mhz
+                st.avg_stretch_mhz = calc_stretch
             else:
-                st.avg_stretch_mhz = (st.avg_stretch_mhz * prev_cycles + result.avg_stretch_mhz) / (prev_cycles + 1)
+                st.avg_stretch_mhz = (st.avg_stretch_mhz * prev_cycles + calc_stretch) / (prev_cycles + 1)
 
         if result.passed:
             st.passes += 1

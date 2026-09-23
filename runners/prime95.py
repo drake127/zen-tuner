@@ -227,9 +227,11 @@ class Prime95Runner(StressRunner):
 
         results_path = os.path.join(work_dir, "results.txt")
         results_file = None
+        smu_mon = req.parameters.get("smu_monitor")
+        core_idx = req.parameters.get("core_idx")
 
         with KernelErrorMonitor(tested_cpus=req.cpus) as kernel_mon, \
-             CycleStretchingMonitor(cpus=req.cpus) as stretch_mon:
+             CycleStretchingMonitor(cpus=req.cpus, smu_monitor=smu_mon, core_idx=core_idx) as stretch_mon:
             try:
                 while True:
                     elapsed = time.time() - start_time

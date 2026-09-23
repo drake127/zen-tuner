@@ -336,13 +336,19 @@ class CursesPresenter(TestEventListener):
             volt_str = f"{st.avg_voltage_v:.4f}V" if st.avg_voltage_v is not None else "--"
             power_str = f"{st.avg_power_w:.2f}W" if st.avg_power_w is not None else "--"
             temp_str = f"{st.avg_temp_c:.0f}°C" if st.avg_temp_c is not None else "--"
-            drop_str = f"-{st.avg_stretch_mhz:.0f}M" if st.avg_stretch_mhz > 0 else "0M"
+            drop_val = st.avg_stretch_mhz
+            if drop_val <= 0 and st.avg_target_mhz and st.avg_effective_mhz:
+                diff = st.avg_target_mhz - st.avg_effective_mhz
+                if diff > 5.0:
+                    drop_val = diff
+            drop_str = f"-{drop_val:.0f}M" if drop_val > 5.0 else "0M"
+            is_stretched = st.stretching_detected or drop_val >= 25.0
 
             if st.avg_effective_mhz and st.avg_target_mhz:
                 eff_str = f"{st.avg_effective_mhz:.0f}"
                 tgt_str = f"{st.avg_target_mhz:.0f}"
-                sc = YELLOW if st.stretching_detected else ""
-                sr = RESET if st.stretching_detected else ""
+                sc = YELLOW if is_stretched else ""
+                sr = RESET if is_stretched else ""
                 eff_col = f"{sc}{eff_str:>8s}{sr}"
                 tgt_col = f"{sc}{tgt_str:>8s}{sr}"
                 drop_col = f"{sc}{drop_str:>6s}{sr}"
@@ -352,8 +358,8 @@ class CursesPresenter(TestEventListener):
                 drop_col = f"{'--':>6s}"
 
             if st.failures == 0 and st.passes > 0:
-                raw_status = "PASS (STRETCH)" if st.stretching_detected else "PASS"
-                status_col = f"{YELLOW if st.stretching_detected else GREEN}{BOLD}{raw_status:<14s}{RESET}"
+                raw_status = "PASS (STRETCH)" if is_stretched else "PASS"
+                status_col = f"{YELLOW if is_stretched else GREEN}{BOLD}{raw_status:<14s}{RESET}"
             elif st.failures > 0:
                 status_col = f"{RED}{BOLD}{f'FAIL ({st.failures})':14s}{RESET}"
             else:
@@ -631,8 +637,25 @@ class CursesPresenter(TestEventListener):
                     row_color = self.COLOR_DEFAULT
 
                 co_str = f"{sm.co_offset:+d}" if sm.co_offset is not None else "--"
-                drop_str = f"-{st.avg_stretch_mhz:.0f}M" if st.avg_stretch_mhz > 0 else "0M"
-                tgt_mhz = st.avg_target_mhz or sm.frequency_mhz
+                if is_active:
+                    tgt_mhz = sm.frequency_mhz
+                    if sm.c0_pct >= 90.0:
+                        live_drop = sm.frequency_mhz - sm.effective_mhz
+                        drop_str = f"-{live_drop:.0f}M" if live_drop > 5.0 else "0M"
+                    else:
+                        drop_str = "0M"
+                else:
+                    if st.passes > 0 or st.failures > 0:
+                        tgt_mhz = st.avg_target_mhz if st.avg_target_mhz else sm.frequency_mhz
+                        drop_val = st.avg_stretch_mhz
+                        if drop_val <= 0 and st.avg_target_mhz and st.avg_effective_mhz:
+                            diff = st.avg_target_mhz - st.avg_effective_mhz
+                            if diff > 5.0:
+                                drop_val = diff
+                        drop_str = f"-{drop_val:.0f}M" if drop_val > 5.0 else "0M"
+                    else:
+                        tgt_mhz = sm.frequency_mhz
+                        drop_str = "--"
 
                 if wide:
                     row_txt = (
@@ -706,8 +729,20 @@ class CursesPresenter(TestEventListener):
                     row_color = self.COLOR_DEFAULT
 
                 if width >= 45:
-                    drop = f"-{st.max_stretch_mhz:.0f}M" if st.max_stretch_mhz > 0 else "0M"
-                    tgt = f"{st.avg_target_mhz:.0f}" if st.avg_target_mhz else "--"
+                    if is_active:
+                        drop = f"-{st.max_stretch_mhz:.0f}M" if st.max_stretch_mhz > 5.0 else "0M"
+                        tgt = f"{st.avg_target_mhz:.0f}" if st.avg_target_mhz else "--"
+                    elif st.passes > 0 or st.failures > 0:
+                        drop_val = st.avg_stretch_mhz
+                        if drop_val <= 0 and st.avg_target_mhz and st.avg_effective_mhz:
+                            diff = st.avg_target_mhz - st.avg_effective_mhz
+                            if diff > 5.0:
+                                drop_val = diff
+                        drop = f"-{drop_val:.0f}M" if drop_val > 5.0 else "0M"
+                        tgt = f"{st.avg_target_mhz:.0f}" if st.avg_target_mhz else "--"
+                    else:
+                        drop = "--"
+                        tgt = "--"
                     row_txt = f"{core_str} {status_str:<8s} {st.passes:>4d} {st.failures:>4d} {tgt:>6s} {drop:>6s}"
                 else:
                     row_txt = f"{core_str} {status_str:<8s} {st.passes:>4d} {st.failures:>4d}"

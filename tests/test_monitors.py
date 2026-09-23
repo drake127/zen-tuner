@@ -87,6 +87,80 @@ class TestMonitors(unittest.TestCase):
         self.assertIsNone(mon.parse_line(line))
 
 
+    def test_stretching_monitor_with_smu(self):
+        from unittest.mock import MagicMock
+        from lib.models import CoreSmuMetrics, PackageSmuMetrics, SmuSnapshot
+
+        mock_smu = MagicMock()
+        mock_smu.is_available.return_value = True
+        slot = CoreSmuMetrics(
+            core_idx=0, slot_idx=0, ccd_idx=0, is_enabled=True,
+            voltage_v=1.35, power_w=15.0, temp_c=65.0,
+            frequency_mhz=4850.0, effective_mhz=4650.0,
+            c0_pct=99.0, c1_pct=1.0, c6_pct=0.0,
+        )
+        mock_smu.read_snapshot.return_value = SmuSnapshot(
+            cores={0: slot}, package=PackageSmuMetrics(0, 0, 0, 0, 0, 0, 0, 0),
+            pm_version=0x380805, slots=[slot],
+        )
+
+        mon = CycleStretchingMonitor(cpus=[0, 12], threshold_mhz=100.0, smu_monitor=mock_smu, core_idx=0)
+        # Force dt >= sample_interval
+        mon.last_sample_time = 0.0
+        alerts = mon.poll()
+
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0].target_mhz, 4850.0)
+        self.assertEqual(alerts[0].effective_mhz, 4650.0)
+        self.assertAlmostEqual(alerts[0].stretch_mhz, 200.0, places=1)
+        self.assertAlmostEqual(mon.avg_stretch_mhz, 200.0, places=1)
+
+    def test_stretching_monitor_noise_filtering(self):
+        from unittest.mock import MagicMock
+        from lib.models import CoreSmuMetrics, PackageSmuMetrics, SmuSnapshot
+
+        mock_smu = MagicMock()
+        mock_smu.is_available.return_value = True
+        # 2 MHz difference is noise and must be filtered out
+        slot = CoreSmuMetrics(
+            core_idx=0, slot_idx=0, ccd_idx=0, is_enabled=True,
+            voltage_v=1.35, power_w=15.0, temp_c=65.0,
+            frequency_mhz=4850.0, effective_mhz=4848.0,
+            c0_pct=99.0, c1_pct=1.0, c6_pct=0.0,
+        )
+        mock_smu.read_snapshot.return_value = SmuSnapshot(
+            cores={0: slot}, package=PackageSmuMetrics(0, 0, 0, 0, 0, 0, 0, 0),
+            pm_version=0x380805, slots=[slot],
+        )
+
+        mon = CycleStretchingMonitor(cpus=[0, 12], threshold_mhz=100.0, smu_monitor=mock_smu, core_idx=0)
+        mon.last_sample_time = 0.0
+        alerts = mon.poll()
+
+        self.assertEqual(len(alerts), 0)
+        self.assertEqual(len(mon.all_samples), 1)
+        self.assertEqual(mon.all_samples[0].stretch_mhz, 0.0)
+        self.assertEqual(mon.avg_stretch_mhz, 0.0)
+
+    def test_get_target_freq_mhz_amd_pstate(self):
+        import tempfile
+        import os
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cpu_dir = os.path.join(tmpdir, "devices", "system", "cpu", "cpu0", "cpufreq")
+            os.makedirs(cpu_dir)
+            with open(os.path.join(cpu_dir, "scaling_driver"), "w") as f:
+                f.write("amd-pstate-epp\n")
+            with open(os.path.join(cpu_dir, "scaling_cur_freq"), "w") as f:
+                f.write("3600000\n")
+            with open(os.path.join(cpu_dir, "amd_pstate_max_freq"), "w") as f:
+                f.write("4950000\n")
+
+            mon = CycleStretchingMonitor(cpus=[0])
+            tgt = mon._get_target_freq_mhz(0, sysfs_root=tmpdir)
+            self.assertEqual(tgt, 4950.0)
+
+
 if __name__ == "__main__":
     unittest.main()
 
