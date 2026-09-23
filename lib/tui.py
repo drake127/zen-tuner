@@ -801,10 +801,17 @@ class CursesPresenter(TestEventListener):
                         f"{sm.c0_pct:3.0f}% {sm.c1_pct:3.0f}% {sm.c6_pct:3.0f}%"
                     )
 
-                attr = self._safe_color_pair(row_color)
                 if is_active:
-                    attr |= curses.A_BOLD | curses.A_REVERSE
-                self._safe_addstr(top + 2 + row_offset, left + 1, row_txt[: width - 2], attr)
+                    attr = self._safe_color_pair(self.COLOR_ACTIVE) | curses.A_BOLD | curses.A_REVERSE
+                    self._safe_addstr(top + 2 + row_offset, left + 1, row_txt[: width - 2], attr)
+                else:
+                    attr = self._safe_color_pair(self.COLOR_DEFAULT)
+                    self._safe_addstr(top + 2 + row_offset, left + 1, row_txt[: width - 2], attr)
+                    status_attr = self._safe_color_pair(row_color)
+                    if row_color in (self.COLOR_PASS, self.COLOR_FAIL, self.COLOR_WARN):
+                        status_attr |= curses.A_BOLD
+                    self._safe_addstr(top + 2 + row_offset, left + 1 + 5, f"{status_str:<8s}", status_attr)
+
                 if star_color is not None:
                     star_attr = self._safe_color_pair(star_color) | curses.A_BOLD
                     if is_active:
@@ -878,10 +885,17 @@ class CursesPresenter(TestEventListener):
                 else:
                     row_txt = f"{core_str} {status_str:<8s} {st.passes:>4d} {st.failures:>4d}"
 
-                attr = self._safe_color_pair(row_color)
                 if is_active:
-                    attr |= curses.A_BOLD | curses.A_REVERSE
-                self._safe_addstr(top + 2 + row_offset, left + 1, row_txt[: width - 2], attr)
+                    attr = self._safe_color_pair(self.COLOR_ACTIVE) | curses.A_BOLD | curses.A_REVERSE
+                    self._safe_addstr(top + 2 + row_offset, left + 1, row_txt[: width - 2], attr)
+                else:
+                    attr = self._safe_color_pair(self.COLOR_DEFAULT)
+                    self._safe_addstr(top + 2 + row_offset, left + 1, row_txt[: width - 2], attr)
+                    status_attr = self._safe_color_pair(row_color)
+                    if row_color in (self.COLOR_PASS, self.COLOR_FAIL, self.COLOR_WARN):
+                        status_attr |= curses.A_BOLD
+                    self._safe_addstr(top + 2 + row_offset, left + 1 + 5, f"{status_str:<8s}", status_attr)
+
                 if star_color is not None:
                     star_attr = self._safe_color_pair(star_color) | curses.A_BOLD
                     if is_active:

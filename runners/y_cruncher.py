@@ -231,10 +231,19 @@ class YCruncherRunner(StressRunner):
             except OSError:
                 pass
 
-        cmd = [self.y_cruncher_bin, "pause:-2", "skip-warnings", "config", cfg_path]
+        cmd = [
+            self.y_cruncher_bin,
+            "pause:-2",
+            "skip-warnings",
+            "colors:0",
+            "status:none",
+            "config",
+            cfg_path,
+        ]
         active_errors: list[str] = []
         idle_mce_errors: list[MceEvent] = []
         verified_tests: list[str] = []
+        last_verified_algo: str | None = None
         completed_tests = 0
         summary_line: str | None = None
         stopping = False
@@ -330,7 +339,8 @@ class YCruncherRunner(StressRunner):
                                 m_pass = PASSED_PATTERN.search(line_clean)
                                 if m_pass:
                                     algo_name = m_pass.group(1)
-                                    if algo_name not in verified_tests:
+                                    if algo_name != last_verified_algo:
+                                        last_verified_algo = algo_name
                                         verified_tests.append(algo_name)
                                         completed_tests += 1
                                         if listener:
@@ -386,10 +396,12 @@ class YCruncherRunner(StressRunner):
                                 m_pass = PASSED_PATTERN.search(line_clean)
                                 if m_pass:
                                     algo_name = m_pass.group(1)
-                                    verified_tests.append(algo_name)
-                                    completed_tests += 1
-                                    if listener:
-                                        listener.on_test_verified(algo_name, completed_tests)
+                                    if algo_name != last_verified_algo:
+                                        last_verified_algo = algo_name
+                                        verified_tests.append(algo_name)
+                                        completed_tests += 1
+                                        if listener:
+                                            listener.on_test_verified(algo_name, completed_tests)
 
                                 # Check failures and errors
                                 m_fail = FAILED_PATTERN.search(line_clean)
