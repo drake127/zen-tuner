@@ -87,6 +87,11 @@ def parse_fft_size_k(fft_name: str) -> float:
     return int(s) / 1024
 
 
+def format_fft_size(fft_name: str) -> str:
+    """Formats a Prime95 FFT length in K or M, converting element counts ('4608' -> '4.5K')."""
+    return fft_name.upper() if fft_name[-1].isalpha() else f"{parse_fft_size_k(fft_name):g}K"
+
+
 def build_fft_config(
     preset: str | None = None,
     min_fft: int | None = None,
@@ -194,7 +199,7 @@ class Prime95OutputParser(OutputParser):
                 self._largest_in_pass = None
             completes = size_k >= self.fft.max_fft
             self._largest_in_pass = None if completes else max(self._largest_in_pass or 0.0, size_k)
-        self.step_verified(fft_name, completes)
+        self.step_verified(f"FFT {format_fft_size(fft_name)}", completes)
 
     def poll(self) -> None:
         if self._results_file is None:

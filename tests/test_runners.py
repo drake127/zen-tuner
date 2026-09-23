@@ -261,7 +261,7 @@ def test_element_sized_fft_does_not_complete_range(listener):
     assert parser.completed_iterations == 0
     feed(parser, ["[2026-09-23T15:03:44] Self-test 5K passed!"])
     assert parser.completed_iterations == 1
-    assert listener.verified == [("4608", 0), ("5K", 1)]
+    assert listener.verified == [("FFT 4.5K", 0, 1), ("FFT 5K", 1, 1)]
 
 
 def test_range_pass_completes_on_wrap(listener):
@@ -269,7 +269,7 @@ def test_range_pass_completes_on_wrap(listener):
     feed(parser, [f"Self-test {size} passed!" for size in ("36K", "40K", "240K", "36K", "40K")])
     # 240K never reaches 248K: the pass completes when the size wraps back to 36K
     assert parser.completed_iterations == 1
-    assert listener.verified[2:4] == [("240K", 0), ("36K", 1)]
+    assert listener.verified[2:4] == [("FFT 240K", 0, 1), ("FFT 36K", 1, 1)]
 
 
 def test_smt_steps_count_once_all_threads_passed(listener):
@@ -282,7 +282,7 @@ def test_smt_steps_count_once_all_threads_passed(listener):
     assert parser.completed_iterations == 1
     feed(parser, ["[2026-09-22T22:48:53] Self-test 36K (thread 1 of 2) passed!"])
     assert parser.done
-    assert listener.verified == [("36K", 1), ("36K", 2)]
+    assert listener.verified == [("FFT 36K", 1, 2), ("FFT 36K", 2, 2)]
 
 
 def test_untagged_steps_count_individually(listener):
@@ -318,7 +318,7 @@ def test_y_cruncher_single_algorithm_iterations(listener):
     parser = YCruncherOutputParser(algorithm_count=1, target_iterations=3, listener=listener)
     feed(parser, ["Running BBP: Passed  Test Speed:  1.62 * 10^08  terms / sec"] * 3)
     assert parser.done
-    assert listener.verified == [("BBP", 1), ("BBP", 2), ("BBP", 3)]
+    assert listener.verified == [("BBP", 1, 3), ("BBP", 2, 3), ("BBP", 3, 3)]
 
 
 def test_y_cruncher_iteration_spans_all_algorithms(listener):
@@ -378,7 +378,7 @@ def test_y_cruncher_stopped_after_last_iteration(listener):
     result = run(scripted(YCruncherRunner, Y_CRUNCHER_SCRIPT.format(passes=2)), YC_PARAMS, listener, target=2)
     assert result.status == RunStatus.PASS
     assert result.completed_iterations == 2
-    assert listener.verified == [("BBP", 1), ("BBP", 2)]
+    assert listener.verified == [("BBP", 1, 2), ("BBP", 2, 2)]
     assert "Running from console..." in listener.lines
     assert result.elapsed_seconds < 5.0
 

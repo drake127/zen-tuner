@@ -13,14 +13,14 @@ from lib.views import Tone
 def test_runner_event_messages(two_cores):
     presenter = CapturingPresenter(two_cores)
     presenter.on_output_line("Test starting")
-    presenter.on_test_verified("4K", 1)
+    presenter.on_test_verified("FFT 4K", 1, 2)
     presenter.on_hardware_error(MceEvent(cpu=13, message="mce: [Hardware Error]: CPU 13: Machine Check",
                                          core_idx=1, tested_core_idx=1))
     presenter.on_hardware_error(MceEvent(cpu=None, message="[Hardware Error]: Corrected error"))
 
     texts = presenter.texts()
     assert presenter.messages[0] == ("Test starting", Tone.DEFAULT)
-    assert "[VERIFIED] Self-test 4K passed! (Iterations: 1)" in texts[1]
+    assert "[VERIFIED] FFT 4K passed (iterations completed: 1/2)" in texts[1]
     assert "HARDWARE ERROR CPU 13 (Core 1) while testing Core 1: mce:" in texts[2]
     assert "HARDWARE ERROR CPU ?: [Hardware Error]" in texts[3]
     assert [tone for _, tone in presenter.messages[1:]] == [Tone.PASS, Tone.FAIL, Tone.FAIL]
@@ -46,7 +46,7 @@ def test_telemetry_samples_track_current_run(two_cores):
 
 def test_core_lifecycle(two_cores):
     presenter = CapturingPresenter(two_cores)
-    presenter.on_session_start(SessionInfo(total_cycles=2))
+    presenter.on_session_start(SessionInfo(target_iterations=2, total_cycles=2))
     presenter.on_cycle_start(1, "prime95")
     presenter.on_core_start(1, two_cores[0], "2T (CPUs 0+12)")
     assert presenter.current_core is two_cores[0]
@@ -60,7 +60,7 @@ def test_core_lifecycle(two_cores):
     texts = presenter.texts()
     assert texts[0] == "▶ Starting Cycle 1 of 2 [prime95]"
     assert "Testing Core 0 (CCD 0) - 2T (CPUs 0+12)" in texts[1]
-    assert texts[2].endswith("Core 0 PASS (2 iterations, 15.0s)")
+    assert texts[2].endswith("Core 0 PASS (2/2 iterations, 15.0s)")
     assert texts[4].endswith("Core 1 FAIL (ERROR): FATAL ERROR: Rounding")
     assert texts[5].endswith("Core 1 INTERRUPTED (Cancelled by user)")
 

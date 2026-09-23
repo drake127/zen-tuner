@@ -94,7 +94,7 @@ class OutputParser(abc.ABC):
         self.steps_verified += 1
         if completes_iteration:
             self.completed_iterations += 1
-        self.listener.on_test_verified(step_name, self.completed_iterations)
+        self.listener.on_test_verified(step_name, self.completed_iterations, self.target_iterations)
 
 
 class _ProcessOutput:

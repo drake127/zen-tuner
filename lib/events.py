@@ -16,8 +16,8 @@ class TestEventListener(Protocol):
         """Called for every non-empty sanitized output line of the stress process."""
         ...
 
-    def on_test_verified(self, step_name: str, completed_iterations: int) -> None:
-        """Called when a self-test step is validated by the stress engine."""
+    def on_test_verified(self, step_name: str, completed_iterations: int, target_iterations: int) -> None:
+        """Called when a test step (e.g. 'FFT 4.5K', 'BBP') is validated by the stress engine."""
         ...
 
     def on_telemetry_sample(self, sample: TelemetrySample) -> None:
@@ -31,7 +31,7 @@ class NullListener:
     def on_output_line(self, line: str) -> None:
         pass
 
-    def on_test_verified(self, step_name: str, completed_iterations: int) -> None:
+    def on_test_verified(self, step_name: str, completed_iterations: int, target_iterations: int) -> None:
         pass
 
     def on_telemetry_sample(self, sample: TelemetrySample) -> None:

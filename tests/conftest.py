@@ -25,14 +25,14 @@ class RecordingListener:
 
     def __init__(self):
         self.lines: list[str] = []
-        self.verified: list[tuple[str, int]] = []
+        self.verified: list[tuple[str, int, int]] = []
         self.samples: list[TelemetrySample] = []
 
     def on_output_line(self, line: str) -> None:
         self.lines.append(line)
 
-    def on_test_verified(self, step_name: str, completed_iterations: int) -> None:
-        self.verified.append((step_name, completed_iterations))
+    def on_test_verified(self, step_name: str, completed_iterations: int, target_iterations: int) -> None:
+        self.verified.append((step_name, completed_iterations, target_iterations))
 
     def on_telemetry_sample(self, sample: TelemetrySample) -> None:
         self.samples.append(sample)

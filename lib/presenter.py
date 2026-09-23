@@ -91,8 +91,10 @@ class Presenter:
     def on_output_line(self, line: str) -> None:
         self._emit(line)
 
-    def on_test_verified(self, step_name: str, completed_iterations: int) -> None:
-        self._event("VERIFIED", f"Self-test {step_name} passed! (Iterations: {completed_iterations})", Tone.PASS)
+    def on_test_verified(self, step_name: str, completed_iterations: int, target_iterations: int) -> None:
+        self._event(
+            "VERIFIED", f"{step_name} passed (iterations completed: {completed_iterations}/{target_iterations})", Tone.PASS
+        )
 
     def on_telemetry_sample(self, sample: TelemetrySample) -> None:
         self.current_samples.append(sample)
@@ -144,7 +146,9 @@ class Presenter:
             self._emit(f"{prefix} INTERRUPTED (Cancelled by user)", Tone.WARN)
         elif result.passed:
             self._emit(
-                f"{prefix} PASS ({result.completed_iterations} iterations, {result.elapsed_seconds:.1f}s)", Tone.PASS
+                f"{prefix} PASS ({result.completed_iterations}/{self.session.target_iterations} iterations, "
+                f"{result.elapsed_seconds:.1f}s)",
+                Tone.PASS,
             )
         else:
             self._emit(f"{prefix} FAIL ({result.status}): {result.error_message}", Tone.FAIL)
